@@ -7,7 +7,7 @@
 1. **查看当前状态**：`python zemax_cli.py status`
 2. **加载现有/官方样例镜头**：`python zemax_cli.py load "<.zmx文件路径>"`
 3. **全新构建系统**：先将结构保存为 `outputs/init_system.json`，再运行 `python zemax_cli.py build outputs/init_system.json`
-4. **单面参数微调与设变量**：`python zemax_cli.py patch --index 2 --radius 100.0 --var-r 1 --var-t 1`
+4. **单面参数微调与设变量**：`python zemax_cli.py patch --index 2 --radius 100.0 --var-r 1 --var-t 1`；恢复自动半口径用 `--semi-diameter-auto`，移动光阑用 `--stop`。
 5. **带物理约束优化**：`python zemax_cli.py optimize --effl 100.0 --max-totr 150.0 --achromatic --wavefront`
 6. **深度像质评估 (MTF & 波前)**：`python zemax_cli.py evaluate --max-freq 50 --points 5`
 7. **保存结果文件**：`python zemax_cli.py save outputs/final_design.zmx`
@@ -41,6 +41,8 @@
 
 ### Phase 2: 渐进式约束优化 (`optimize`)
 
+* `optimize` 会按本次请求重建评价函数。需要保留原有 MFE 时先 `save`；自定义约束置于 `DMFS` 上方。
+* **自定义操作数行引用**：不要在 `--custom-op` 中直接复用旧 MFE 的 OPLT、OPGT、OPVA、DIFF、SUMM、GOTO 等绝对行号。内置约束会随请求改变行布局，客户端不会自动重映射引用；总长和后截距优先使用 `--max-totr`、`--min-bfl`。
 * **有焦系统铁律**：调用 `optimize` 时**必须带上 `--effl <目标焦距>` 参数**！绝不允许在不锁定焦距的情况下裸跑优化。
 * **无焦系统（如开普勒/伽利略望远镜）铁律**：**严禁一上来就开启 `afocal_mode: true` 全局盲目优化！** 必须拆分为：
 1. 先按有焦模式独立构建并优化物镜（保存参数）。
@@ -54,6 +56,8 @@
 
 优化收敛后，必须运行 `python zemax_cli.py evaluate` 进行光学体检：
 
-1. **焦距核对**：确认 `effective_focal_length_mm` 与目标焦距误差 `< 1%`。
-2. **马瑞（Maréchal）衍射极限判据**：检查 `wavefront_summary` 中的 `rms_wavefront_waves`。若 `< 0.0715`（`diffraction_limited: true`），则已达衍射极限；若点列图优化后波前差仍大于 `0.15`，应执行 `python zemax_cli.py optimize --effl <焦距> --achromatic --wavefront` 切换为波前差基底二次精修。
+1. **结果有效性**：先检查 `status`、`evaluation_valid` 和各视场的 `wavefront_valid`。RWCE 为零时视为待确认，不得按衍射极限验收；`strehl_ratio_approx=null` 表示无法评估。
+2. **焦距核对**：确认 `effective_focal_length_mm` 与目标焦距误差 `< 1%`。
+3. **马瑞（Maréchal）衍射极限判据**：检查 `wavefront_summary` 中的 `rms_wavefront_waves`。若 `< 0.0715`（`diffraction_limited: true`），则已达衍射极限；若点列图优化后波前差仍大于 `0.15`，应执行 `python zemax_cli.py optimize --effl <焦距> --achromatic --wavefront` 切换为波前差基底二次精修。
+4. **MTF 采样**：`evaluate --mtf-sampling 3` 默认使用采样级别 3。实际曲线采用 `Grid=0` 稀疏积分，不能将级别解释成固定 FFT 网格尺寸；应对同一镜头逐级比较 2、3、4 的返回值，再判断是否满足所需精度。
 

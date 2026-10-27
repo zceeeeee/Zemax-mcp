@@ -28,6 +28,10 @@ def main():
     p_patch.add_argument("--material", type=str, help="玻璃材料")
     p_patch.add_argument("--var-r", type=int, choices=[0, 1], help="曲率半径是否设为变量(1是,0否)")
     p_patch.add_argument("--var-t", type=int, choices=[0, 1], help="厚度是否设为变量(1是,0否)")
+    p_aperture = p_patch.add_mutually_exclusive_group()
+    p_aperture.add_argument("--semi-diameter", type=float, help="固定半口径(mm)，必须为正数，通常优先使用自动半口径")
+    p_aperture.add_argument("--semi-diameter-auto", action="store_true", help="恢复半口径 Automatic 求解")
+    p_patch.add_argument("--stop", action="store_true", help="将光阑移动到该面")
 
     # 5. optimize
     p_opt = subparsers.add_parser("optimize", help="带宏观物理约束的自动评价函数构建与 DLS 优化")
@@ -44,6 +48,7 @@ def main():
     p_eval = subparsers.add_parser("evaluate", help="读取波前 RMS (λ)、斯特列尔比与 MTF 曲线数据")
     p_eval.add_argument("--max-freq", type=float, default=50.0, help="最大空间频率 (默认 50 lp/mm)")
     p_eval.add_argument("--points", type=int, default=5, help="频率采样点数 (默认 5 个点)")
+    p_eval.add_argument("--mtf-sampling", type=int, choices=[1, 2, 3, 4], default=3, help="MTF 采样级别 (默认 3，Grid=0 稀疏积分；逐级比较以检查收敛)")
 
     # 7. save
     p_save = subparsers.add_parser("save", help="保存镜头文件")
@@ -70,6 +75,9 @@ def main():
             if args.material is not None: payload["material"] = args.material
             if args.var_r is not None: payload["radius_variable"] = bool(args.var_r)
             if args.var_t is not None: payload["thickness_variable"] = bool(args.var_t)
+            if args.semi_diameter is not None: payload["semi_diameter"] = args.semi_diameter
+            if args.semi_diameter_auto: payload["semi_diameter_auto"] = True
+            if args.stop: payload["is_stop"] = True
             resp = requests.post(f"{SERVER_URL}/patch_surface", json=payload)
         elif args.command == "optimize":
             payload = {
@@ -84,7 +92,10 @@ def main():
             if args.custom_op: payload["custom_operands"] = json.loads(args.custom_op)
             resp = requests.post(f"{SERVER_URL}/optimize", json=payload)
         elif args.command == "evaluate":
-            resp = requests.post(f"{SERVER_URL}/evaluate", json={"max_frequency": args.max_freq, "num_freq_points": args.points})
+            resp = requests.post(f"{SERVER_URL}/evaluate", json={
+                "max_frequency": args.max_freq, "num_freq_points": args.points,
+                "mtf_sampling": args.mtf_sampling
+            })
         elif args.command == "save":
             resp = requests.post(f"{SERVER_URL}/save", json={"filepath": args.filepath})
 

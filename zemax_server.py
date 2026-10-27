@@ -54,6 +54,9 @@ class SurfacePatchRequest(BaseModel):
     material: Optional[str] = None
     radius_variable: Optional[bool] = None
     thickness_variable: Optional[bool] = None
+    semi_diameter: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False, description="固定半口径(mm)，必须为正数")
+    semi_diameter_auto: bool = Field(default=False, strict=True, description="恢复半口径 Automatic 求解")
+    is_stop: Optional[bool] = Field(default=None, strict=True, description="True 将光阑移至该面；不能用 False 取消现有光阑")
 
 class CustomOperandItem(BaseModel):
     operand_type: str = Field(description="操作数名称，如 'EFFL', 'TOTR', 'AXCL', 'EXPP', 'PMAG'")
@@ -75,8 +78,9 @@ class OptimizeRequest(BaseModel):
     custom_operands: List[CustomOperandItem] = Field(default=[])
 
 class EvaluateRequest(BaseModel):
-    max_frequency: float = Field(default=50.0, description="MTF 最大评估空间频率 (lp/mm)")
-    num_freq_points: int = Field(default=5, description="频率采样点数量")
+    max_frequency: float = Field(default=50.0, gt=0, allow_inf_nan=False, description="MTF 最大评估空间频率 (lp/mm)")
+    num_freq_points: int = Field(default=5, ge=1, description="频率采样点数量")
+    mtf_sampling: int = Field(default=3, ge=1, le=4, strict=True, description="MTF 采样级别 (1–4)，Grid=0 使用稀疏积分，需逐级检查收敛")
 
 class FileRequest(BaseModel):
     filepath: str = Field(description="完整文件路径 (.zmx)")
@@ -141,15 +145,20 @@ def _get_rms_spot_radii(oss):
         if not spot.Succeeded:
             raise RuntimeError(str(spot.ErrorMessage) or "RMS 点斑计算失败")
         radii = spot.RMSSpotRadii
-        return [
+        if radii.GetLength(0) == 0 or radii.GetLength(1) == 0:
+            raise RuntimeError("RMS 点斑计算未返回配置或视场数据")
+        result = [
             [float(radii.GetValue(config, field)) for field in range(radii.GetLength(1))]
             for config in range(radii.GetLength(0))
         ]
+        if any(not math.isfinite(value) or value < 0.0 for row in result for value in row):
+            raise RuntimeError("RMS 点斑计算返回无效数值")
+        return result
     finally:
         spot.Close()
 
 def _json_safe_state(value):
-    """仅转换状态输出中的非有限浮点数，保留无限远的含义。"""
+    """递归转换响应中的非有限浮点数，保留无限远的含义。"""
     if isinstance(value, float) and not math.isfinite(value):
         if math.isnan(value):
             return None
@@ -223,10 +232,6 @@ def load_zmx_file(req: FileRequest):
         if not os.path.exists(abs_path):
             return {"status": "error", "message": f"找不到文件: {abs_path}"}
         oss.load(abs_path)
-        try:
-            oss.Analyses.New_Analysis(zp.constants.Analysis.AnalysisIDM.Draw2D)
-        except Exception:
-            pass
         return {"status": "ok", "loaded_file": abs_path, "data": _extract_system_state(oss)}
     except Exception as e:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
@@ -266,10 +271,6 @@ def build_system(req: SystemBuildRequest):
             _set_variable(surf.RadiusCell, item.radius_variable)
             _set_variable(surf.ThicknessCell, item.thickness_variable)
 
-        try:
-            oss.Analyses.New_Analysis(zp.constants.Analysis.AnalysisIDM.Draw2D)
-        except Exception:
-            pass
         return {"status": "ok", "data": _extract_system_state(oss)}
     except Exception as e:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
@@ -282,6 +283,34 @@ def patch_surface(req: SurfacePatchRequest):
         if req.surface_index < 1 or req.surface_index >= lde.NumberOfSurfaces - 1:
             return {"status": "error", "message": f"表面序号 {req.surface_index} 超出可编辑范围"}
         surf = lde.GetSurfaceAt(req.surface_index)
+        if req.semi_diameter_auto and req.semi_diameter is not None:
+            return {"status": "error", "message": "固定半口径与自动半口径不能同时设置"}
+        if req.is_stop is False and surf.IsStop:
+            return {"status": "error", "message": "不能直接取消当前光阑，请对替代表面设置 is_stop=true"}
+        if req.is_stop is True and not surf.TypeData.CanBeStop:
+            return {"status": "error", "message": "该表面类型不能作为光阑"}
+
+        semi_cell = None
+        if req.semi_diameter_auto or req.semi_diameter is not None:
+            semi_cell = surf.SemiDiameterCell
+            semi_type = (zp.constants.Editors.SolveType.Automatic if req.semi_diameter_auto
+                         else zp.constants.Editors.SolveType.Fixed)
+            if not semi_cell.IsSolveTypeSupported(semi_type):
+                return {"status": "error", "message": "该表面不支持请求的半口径求解类型"}
+            semi_solve = semi_cell.CreateSolveType(semi_type)
+            if semi_solve is None or not semi_solve.IsValid:
+                return {"status": "error", "message": "无法创建半口径求解"}
+
+        if semi_cell is not None:
+            result = semi_cell.SetSolveData(semi_solve)
+            if result != zp.constants.Editors.SolveStatus.Success or semi_cell.Solve != semi_type:
+                raise RuntimeError(f"设置半口径求解失败: {result}")
+            if req.semi_diameter is not None:
+                surf.SemiDiameter = float(req.semi_diameter)
+        if req.is_stop is True:
+            surf.IsStop = True
+            if not surf.IsStop:
+                raise RuntimeError("光阑移动失败")
         if req.radius is not None: surf.Radius = float(req.radius)
         if req.thickness is not None: surf.Thickness = float(req.thickness)
         if req.material is not None: surf.Material = req.material.upper().strip()
@@ -298,6 +327,10 @@ def run_optimization(req: OptimizeRequest):
         mfe = oss.MFE
         op_enum = zp.constants.Editors.MFE.MeritOperandType
         prim_wl = _get_primary_wavelength_index(oss)
+        for item in req.custom_operands:
+            op_name = item.operand_type.upper().strip()
+            if not hasattr(op_enum, op_name):
+                return {"status": "error", "message": f"未知的操作数名称: {op_name}"}
 
         wizard = mfe.SEQOptimizationWizard
         wizard.Type = 0
@@ -311,6 +344,11 @@ def run_optimization(req: OptimizeRequest):
         wizard.AirMin = 0.5
         wizard.AirMax = 500.0
         wizard.AirEdge = 0.5
+        # 每次按本次请求重建，避免向导保留 DMFS 上方的旧约束并重复累积。
+        if mfe.NumberOfOperands > 0:
+            mfe.RemoveOperandsAt(1, mfe.NumberOfOperands)
+        wizard.StartAt = 1
+        wizard.IsAddFavoriteOperandsUsed = False
         wizard.Apply()
 
         curr_row = 1
@@ -336,8 +374,6 @@ def run_optimization(req: OptimizeRequest):
                 curr_row += 1
         for item in req.custom_operands:
             op_name = item.operand_type.upper().strip()
-            if not hasattr(op_enum, op_name):
-                return {"status": "error", "message": f"未知的操作数名称: {op_name}"}
             _insert_operand_row(mfe, curr_row, getattr(op_enum, op_name), item.target, item.weight,
                                 item.int1, item.int2, item.data1, item.data2)
             curr_row += 1
@@ -385,19 +421,28 @@ def evaluate_image_quality(req: EvaluateRequest):
         num_fields = oss.SystemData.Fields.NumberOfFields
         prim_wl = _get_primary_wavelength_index(oss)
         field_coordinates = _get_normalized_field_coordinates(oss.SystemData.Fields)
+        # 操作数的 0 值不能单独证明追迹成功，先运行有 Succeeded 状态的独立工具。
+        _get_rms_spot_radii(oss)
+        issues = []
 
         wavefront_results = []
         for f_idx in range(1, num_fields + 1):
             fov_y = float(oss.SystemData.Fields.GetField(f_idx).Y)
             hx, hy = field_coordinates[f_idx - 1]
             rms_wf = float(mfe.GetOperandValue(op_type.RWCE, 4, prim_wl, hx, hy, 0.0, 0.0, 0.0, 0.0))
-            strehl = math.exp(-((2 * math.pi * rms_wf) ** 2)) if 0.0 <= rms_wf < 1.0 else 0.0
+            wavefront_valid = math.isfinite(rms_wf) and 0.0 < rms_wf < 1e6
+            if not wavefront_valid:
+                issues.append(f"视场 {f_idx} 的 RWCE 为零或无效，无法确认波前像质")
+            strehl = None
+            if wavefront_valid:
+                strehl = math.exp(-((2 * math.pi * rms_wf) ** 2)) if rms_wf < 1.0 else 0.0
             wavefront_results.append({
                 "field_index": f_idx,
                 "field_y_deg": fov_y,
                 "rms_wavefront_waves": round(rms_wf, 4),
-                "diffraction_limited": bool(0.0 <= rms_wf < 0.0715),
-                "strehl_ratio_approx": round(strehl, 4)
+                "wavefront_valid": wavefront_valid,
+                "diffraction_limited": bool(wavefront_valid and rms_wf < 0.0715),
+                "strehl_ratio_approx": round(strehl, 4) if strehl is not None else None
             })
 
         freq_step = req.max_frequency / max(req.num_freq_points, 1)
@@ -407,12 +452,16 @@ def evaluate_image_quality(req: EvaluateRequest):
             fov_y = float(oss.SystemData.Fields.GetField(f_idx).Y)
             curve_data = []
             for freq in frequencies:
-                mtf_t = float(mfe.GetOperandValue(op_type.MTFT, 2, 0, f_idx, freq, 0.0, 0.0, 0.0, 0.0))
-                mtf_s = float(mfe.GetOperandValue(op_type.MTFS, 2, 0, f_idx, freq, 0.0, 0.0, 0.0, 0.0))
+                mtf_t = float(mfe.GetOperandValue(op_type.MTFT, req.mtf_sampling, 0, f_idx, freq, 0.0, 0.0, 0.0, 0.0))
+                mtf_s = float(mfe.GetOperandValue(op_type.MTFS, req.mtf_sampling, 0, f_idx, freq, 0.0, 0.0, 0.0, 0.0))
                 # 2024 R2 手册 p.1078：Field=0、Grid=1 返回衍射极限。
-                mtf_dl = float(mfe.GetOperandValue(op_type.MTFA, 2, 0, 0.0, freq, 1.0, 0.0, 0.0, 0.0))
+                mtf_dl = float(mfe.GetOperandValue(op_type.MTFA, req.mtf_sampling, 0, 0.0, freq, 1.0, 0.0, 0.0, 0.0))
+                mtf_valid = all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in (mtf_t, mtf_s, mtf_dl))
+                if not mtf_valid:
+                    issues.append(f"视场 {f_idx} 在频率 {freq} 的 MTF 返回无效数值")
                 curve_data.append({
                     "frequency": freq,
+                    "mtf_valid": mtf_valid,
                     "tangential": round(mtf_t, 4),
                     "sagittal": round(mtf_s, 4),
                     "average": round((mtf_t + mtf_s) / 2.0, 4),
@@ -423,12 +472,20 @@ def evaluate_image_quality(req: EvaluateRequest):
         effl = float(mfe.GetOperandValue(op_type.EFFL, 0, prim_wl, 0, 0.0, 0.0, 0.0, 0.0, 0.0))
         wfno = float(mfe.GetOperandValue(op_type.WFNO, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
-        return {
-            "status": "ok",
+        if not all(math.isfinite(value) and abs(value) < 1e6 for value in (effl, wfno)):
+            issues.append("焦距或工作 F 数返回非有限数值或错误哨兵")
+        return _json_safe_state({
+            "status": "error" if issues else "ok",
+            "evaluation_valid": not issues,
+            "issues": issues,
+            "mtf_sampling": req.mtf_sampling,
+            "mtf_grid": 0,
+            "mtf_diffraction_limit_grid": 1,
+            "mtf_sampling_converged": None,
             "paraxial_specs": {"effective_focal_length_mm": round(effl, 3), "working_f_number": round(wfno, 3)},
             "wavefront_summary": wavefront_results,
             "mtf_summary": mtf_results
-        }
+        })
     except Exception as e:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
