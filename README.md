@@ -47,7 +47,7 @@ $env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
 - `build` 会替换当前光学系统；操作已有镜头前先 `save`。
 - 用 `load outputs/test_singlet_wavefront_optimized.zmx` 可恢复本机已保存的二次优化结构；生成镜头不随仓库分发。
 - 有焦系统优化必须指定 `--effl`。光线追迹失败时先修正结构，不能不改参数反复优化。
-- 无穷大状态值输出为字符串 `"Infinity"` / `"-Infinity"`，NaN 输出为 `null`。
+- 无穷大状态值输出为字符串 `"Infinity"` / `"-Infinity"`，NaN 输出为 `null`。请求参数校验失败时，错误详情中的非有限输入也按此规则转换，保留 JSON 格式的 HTTP 422 响应，避免错误响应本身触发 HTTP 500。
 - `rms_spot_radius` 为“配置 × 视场”的二维列表，单位采用当前镜头单位（示例为 mm）。
 - 波前 RMS 在主波长处计算，RWCE 使用系统设置对应的归一化视场坐标。
 - MTF 的实际曲线采用多色光 MTFT/MTFS；衍射极限采用 MTFA 的 `Field=0, Grid=1` 参考响应，并非各视场独立的理想上限。频率单位遵循镜头设置（示例为 lp/mm）。
@@ -64,7 +64,7 @@ $env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
 
 ## 当前验证状态
 
-2026-10-27 已在本机完成真实 CLI 闭环：连接 → 状态读取 → 构建 → 焦距约束点列图优化 → 评估 → 保存 → 波前/轴向色差约束二次优化 → 评估 → 保存。两次优化及最终状态均返回 `ray_trace_valid=true`。后续防护与接口扩展已通过 23 项离线回归测试及 `pip check`；本轮 MFE 重建、可配置 MTF 采样、自动半口径和光阑移动尚待新版服务端实机验证。下表保留此前闭环的历史结果。
+2026-10-27 已在本机完成真实 CLI 闭环：连接 → 状态读取 → 构建 → 焦距约束点列图优化 → 评估 → 保存 → 波前/轴向色差约束二次优化 → 评估 → 保存。两次优化及最终状态均返回 `ray_trace_valid=true`。后续防护与接口扩展已通过 25 项离线回归测试及 `pip check`；本轮 MFE 重建、可配置 MTF 采样、自动半口径和光阑移动尚待新版服务端实机验证。下表保留此前闭环的历史结果。
 
 本轮实机复测时，服务端在连接 API 阶段返回 `OpticStudio Licence is not valid for API, connection not established` 并退出，CLI 因而无法连接。恢复有效的 API 授权和 Interactive Extension 连接后，需要重新启动服务端，再执行上述功能及 MTF 采样收敛验证。
 
@@ -101,7 +101,7 @@ $env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-离线测试不导入服务端、不连接 OpticStudio，覆盖接口适配辅助函数及异常时的工具释放。测试通过仅说明离线逻辑正确，光学指标必须以真实 CLI 评估结果为准。
+离线测试不导入服务端、不连接 OpticStudio，覆盖接口适配辅助函数及异常时的工具释放，并通过独立 FastAPI ASGI 应用验证参数校验的 HTTP 响应及 JSON 序列化，不启动 Zemax 连接。测试通过仅说明离线逻辑正确，光学指标必须以真实 CLI 评估结果为准。
 
 ## 文件布局
 

@@ -1,5 +1,6 @@
 """Offline checks: extract helpers without importing ZOSPy or connecting to OpticStudio."""
 import ast
+import asyncio
 import json
 import math
 from pathlib import Path
@@ -69,6 +70,42 @@ def server_function(name, **bindings):
     namespace = dict(NAMESPACE, traceback=traceback, **bindings)
     exec(compile(ast.Module(body=[route], type_ignores=[]), "<server-route>", "exec"), namespace)
     return namespace[name]
+
+
+def validation_app():
+    from fastapi import FastAPI, Request
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel, Field
+    from typing import Optional
+
+    namespace = dict(NAMESPACE, app=FastAPI(), BaseModel=BaseModel, Field=Field, Optional=Optional,
+                     Request=Request, RequestValidationError=RequestValidationError,
+                     JSONResponse=JSONResponse, jsonable_encoder=jsonable_encoder, zm=Mock())
+    namespace["zm"].connect.side_effect = AssertionError("Validation must reject input before connecting")
+    names = {"SurfacePatchRequest", "EvaluateRequest", "request_validation_error_handler",
+             "patch_surface", "evaluate_image_quality"}
+    nodes = [node for node in TREE.body
+             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<validation-app>", "exec"), namespace)
+    return namespace["app"], namespace["zm"]
+
+
+async def asgi_post(app, path, body):
+    messages = []
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(),
+             "query_string": b"", "root_path": "", "server": ("testserver", 80),
+             "client": ("127.0.0.1", 1234), "headers": [(b"content-type", b"application/json")]}
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+    async def send(message):
+        messages.append(message)
+    await app(scope, receive, send)
+    status = next(message["status"] for message in messages if message["type"] == "http.response.start")
+    content = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+    return status, json.loads(content)
 
 
 class PatchSurface:
@@ -160,6 +197,43 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(converted, {"radii": ["Infinity", "-Infinity", None, 0.0, 12.5], "ok": True})
         self.assertTrue(math.isinf(data["radii"][0]))
         json.dumps(converted, allow_nan=False)
+
+    def test_request_validation_nonfinite_inputs_return_json_422(self):
+        app, manager = validation_app()
+        cases = [
+            ("/patch_surface", b'{"surface_index":1,"semi_diameter":1e309}', "semi_diameter", "Infinity"),
+            ("/patch_surface", b'{"surface_index":1,"semi_diameter":-1e309}', "semi_diameter", "-Infinity"),
+            ("/patch_surface", b'{"surface_index":1,"semi_diameter":NaN}', "semi_diameter", None),
+            ("/evaluate", b'{"max_frequency":1e309}', "max_frequency", "Infinity"),
+            ("/evaluate", b'{"max_frequency":-1e309}', "max_frequency", "-Infinity"),
+            ("/evaluate", b'{"max_frequency":NaN}', "max_frequency", None),
+            ("/evaluate", b'{"mtf_sampling":{"nested":[NaN,1e309]}}', "mtf_sampling", {"nested": [None, "Infinity"]}),
+        ]
+        for path, body, field, expected_input in cases:
+            with self.subTest(path=path, body=body):
+                status, result = asyncio.run(asgi_post(app, path, body))
+                self.assertEqual(status, 422)
+                error = result["detail"][0]
+                self.assertEqual(error["loc"], ["body", field])
+                self.assertEqual(error["input"], expected_input)
+                json.dumps(result, allow_nan=False)
+        manager.connect.assert_not_called()
+
+    def test_request_validation_preserves_normal_error_details(self):
+        app, manager = validation_app()
+        for path, body, error_type in (
+            ("/evaluate", b'{"max_frequency":0}', "greater_than"),
+            ("/evaluate", b'{"num_freq_points":0}', "greater_than_equal"),
+            ("/patch_surface", b'{}', "missing"),
+            ("/evaluate", b'{"max_frequency":', "json_invalid"),
+        ):
+            with self.subTest(path=path, body=body):
+                status, result = asyncio.run(asgi_post(app, path, body))
+                self.assertEqual(status, 422)
+                self.assertEqual(result["detail"][0]["type"], error_type)
+                self.assertIn("msg", result["detail"][0])
+                json.dumps(result, allow_nan=False)
+        manager.connect.assert_not_called()
 
     def test_operand_cells_receive_enum_members(self):
         columns = SimpleNamespace(**{f"Param{i}": object() for i in range(1, 5)})

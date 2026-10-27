@@ -3,7 +3,10 @@ import os
 import math
 import traceback
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import zospy as zp
@@ -211,6 +214,11 @@ def _extract_system_state(oss) -> Dict[str, Any]:
     })
 
 # ==================== API 路由定义 ====================
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError):
+    """校验错误保留原始输入，非有限数值也需先转换再序列化。"""
+    return JSONResponse(status_code=422, content=_json_safe_state(jsonable_encoder({"detail": exc.errors()})))
 
 @app.on_event("startup")
 def startup_event():
