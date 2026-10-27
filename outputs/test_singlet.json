@@ -1,0 +1,24 @@
+{
+  "epd": 25.0,
+  "fovs": [0.0],
+  "afocal_mode": false,
+  "surfaces": [
+    {
+      "comment": "Singlet front",
+      "radius": 103.36,
+      "thickness": 5.0,
+      "material": "N-BK7",
+      "is_stop": true,
+      "radius_variable": true,
+      "thickness_variable": false
+    },
+    {
+      "comment": "Singlet rear",
+      "radius": -103.36,
+      "thickness": 98.3,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    }
+  ]
+}

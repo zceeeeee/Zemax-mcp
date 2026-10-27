@@ -1,0 +1,7 @@
+pythonnet>=3.0.3
+zospy>=1.2.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pydantic>=2.6.0
+requests>=2.31.0
+numpy>=1.24.0

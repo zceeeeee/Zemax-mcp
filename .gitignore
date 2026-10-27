@@ -1,0 +1,29 @@
+# Python environment and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local settings, credentials and logs
+.env
+.env.*
+!.env.example
+.claude/
+*.log
+
+# Local conversation history
+claude_readme.md
+完整对话轮.md
+
+# Zemax generated files; keep the reproducible sample configuration
+outputs/*
+!outputs/test_singlet.json
+*.ZDA
+*.zda
+*.ZOS
+*.zos
+*.BAK
+*.bak
