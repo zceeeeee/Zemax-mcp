@@ -43,12 +43,14 @@ class SurfaceItem(BaseModel):
     is_stop: bool = Field(default=False, description="是否为光阑面(STO)")
     radius_variable: bool = Field(default=False, description="曲率半径是否设为变量(V)")
     thickness_variable: bool = Field(default=False, description="厚度是否设为变量(V)")
+    marginal_ray_height_solve: bool = Field(default=False, description="厚度是否设为边缘光线高度求解(高斯像面)")
 
 class SystemBuildRequest(BaseModel):
     epd: float = Field(description="入瞳直径 (mm)")
     fovs: List[float] = Field(default=[0.0], description="Y方向视场角列表 (度)")
     afocal_mode: bool = Field(default=False, description="是否开启无焦像空间模式(望远系统用)")
     surfaces: List[SurfaceItem] = Field(description="从第1面到像面前一面的表面列表")
+    wavelength_preset: str = Field(default="HeNe_0p6328", description="波长预设，可选 HeNe_0p6328 或 FdC_Visible")
 
 class SurfacePatchRequest(BaseModel):
     surface_index: int = Field(description="要修改的表面序号 (从1开始)")
@@ -57,6 +59,7 @@ class SurfacePatchRequest(BaseModel):
     material: Optional[str] = None
     radius_variable: Optional[bool] = None
     thickness_variable: Optional[bool] = None
+    marginal_ray_height_solve: Optional[bool] = Field(default=None, description="是否将厚度设置为边缘光线高度求解")
     semi_diameter: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False, description="固定半口径(mm)，必须为正数")
     semi_diameter_auto: bool = Field(default=False, strict=True, description="恢复半口径 Automatic 求解")
     is_stop: Optional[bool] = Field(default=None, strict=True, description="True 将光阑移至该面；不能用 False 取消现有光阑")
@@ -78,6 +81,7 @@ class OptimizeRequest(BaseModel):
     max_totr: Optional[float] = Field(default=None, description="限制最大总长 TOTR <= 该值 (mm)")
     min_bfl: Optional[float] = Field(default=None, description="限制最小后截距 >= 该值 (mm)")
     minimize_axial_color: bool = Field(default=False, description="是否加入 AXCL 消除轴向色差")
+    use_trac_spherical_mf: bool = Field(default=False, description="使用讲义专用的6孔径带TRAC+MNCA+MXCA+EFFL评价函数")
     custom_operands: List[CustomOperandItem] = Field(default=[])
 
 class EvaluateRequest(BaseModel):
@@ -96,9 +100,19 @@ def _set_variable(cell, is_var: bool):
     solve = cell.CreateSolveType(solve_type)
     cell.SetSolveData(solve)
 
+def _set_marginal_ray_height_solve(cell, height: float = 0.0, pupil_zone: float = 0.0):
+    """将厚度单元格设置为边缘光线高度求解 (Marginal Ray Height) 以定位高斯像面"""
+    solve = cell.CreateSolveType(zp.constants.Editors.SolveType.MarginalRayHeight)
+    target = getattr(solve, "_S_MarginalRayHeight", getattr(solve, "MarginalRayHeight", solve))
+    if hasattr(target, "Height"):
+        target.Height = float(height)
+    if hasattr(target, "PupilZone"):
+        target.PupilZone = float(pupil_zone)
+    cell.SetSolveData(solve)
+
 def _insert_operand_row(mfe, row_idx: int, op_enum, target: float, weight: float,
-                        int1=None, int2=None, data1=None, data2=None):
-    """在 MFE 指定行插入操作数并写入参数 (Cell 2=Int1, 3=Int2, 4=Data1, 5=Data2)"""
+                        int1=None, int2=None, data1=None, data2=None, data3=None, data4=None):
+    """在 MFE 指定行插入操作数并写入参数 (Cell 2=Int1, 3=Int2, 4=Data1, 5=Data2, 6=Data3, 7=Data4)"""
     op = mfe.InsertNewOperandAt(row_idx)
     op.ChangeType(op_enum)
     op.Target = float(target)
@@ -108,6 +122,12 @@ def _insert_operand_row(mfe, row_idx: int, op_enum, target: float, weight: float
     if int2 is not None: op.GetOperandCell(column.Param2).IntegerValue = int(int2)
     if data1 is not None: op.GetOperandCell(column.Param3).DoubleValue = float(data1)
     if data2 is not None: op.GetOperandCell(column.Param4).DoubleValue = float(data2)
+    if data3 is not None:
+        col5 = getattr(column, "Param5", 6)
+        op.GetOperandCell(col5).DoubleValue = float(data3)
+    if data4 is not None:
+        col6 = getattr(column, "Param6", 7)
+        op.GetOperandCell(col6).DoubleValue = float(data4)
     return op
 
 def _get_primary_wavelength_index(oss) -> int:
@@ -205,10 +225,29 @@ def _extract_system_state(oss) -> Dict[str, Any]:
     except Exception:
         pass
 
+    geo_spot_radius_um = None
+    geo_spot_diameter_um = None
+    if ray_trace_ok:
+        try:
+            prim_wl = _get_primary_wavelength_index(oss)
+            op_trac = zp.constants.Editors.MFE.MeritOperandType.TRAC
+            py_samples = [0.0, 0.1, 0.3, 0.5, 0.7, 0.85, 0.9, 0.95, 1.0]
+            max_trac = 0.0
+            for py in py_samples:
+                val = abs(float(oss.MFE.GetOperandValue(op_trac, prim_wl, 0, 0.0, 0.0, 0.0, float(py), 0.0, 0.0)))
+                if math.isfinite(val) and val > max_trac:
+                    max_trac = val
+            geo_spot_radius_um = round(max_trac * 1000.0, 4)
+            geo_spot_diameter_um = round(geo_spot_radius_um * 2.0, 4)
+        except Exception:
+            pass
+
     return _json_safe_state({
         "num_surfaces": lde.NumberOfSurfaces,
         "ray_trace_valid": ray_trace_ok,
         "rms_spot_radius": rms_spot,
+        "geo_spot_radius_um": geo_spot_radius_um,
+        "geo_spot_diameter_um": geo_spot_diameter_um,
         "merit_function": merit_val,
         "surfaces": surfaces_info
     })
@@ -252,7 +291,13 @@ def build_system(req: SystemBuildRequest):
         oss.SystemData.Aperture.ApertureType = zp.constants.SystemData.ZemaxApertureType.EntrancePupilDiameter
         oss.SystemData.Aperture.ApertureValue = float(req.epd)
         oss.SystemData.Aperture.AfocalImageSpace = bool(req.afocal_mode)
-        oss.SystemData.Wavelengths.SelectWavelengthPreset(zp.constants.SystemData.WavelengthPreset.FdC_Visible)
+
+        preset_name = req.wavelength_preset
+        preset_enum = getattr(zp.constants.SystemData.WavelengthPreset, preset_name, None)
+        if preset_enum is not None:
+            oss.SystemData.Wavelengths.SelectWavelengthPreset(preset_enum)
+        else:
+            return {"status": "error", "message": f"未知的波长预设: {preset_name}"}
 
         fields = oss.SystemData.Fields
         fields.DeleteAllFields()
@@ -277,7 +322,10 @@ def build_system(req: SystemBuildRequest):
             if item.is_stop:
                 surf.IsStop = True
             _set_variable(surf.RadiusCell, item.radius_variable)
-            _set_variable(surf.ThicknessCell, item.thickness_variable)
+            if item.marginal_ray_height_solve:
+                _set_marginal_ray_height_solve(surf.ThicknessCell, 0.0, 0.0)
+            else:
+                _set_variable(surf.ThicknessCell, item.thickness_variable)
 
         return {"status": "ok", "data": _extract_system_state(oss)}
     except Exception as e:
@@ -323,10 +371,43 @@ def patch_surface(req: SurfacePatchRequest):
         if req.thickness is not None: surf.Thickness = float(req.thickness)
         if req.material is not None: surf.Material = req.material.upper().strip()
         if req.radius_variable is not None: _set_variable(surf.RadiusCell, req.radius_variable)
-        if req.thickness_variable is not None: _set_variable(surf.ThicknessCell, req.thickness_variable)
+        mrhs = getattr(req, "marginal_ray_height_solve", None)
+        if mrhs is not None:
+            if mrhs:
+                _set_marginal_ray_height_solve(surf.ThicknessCell, 0.0, 0.0)
+            else:
+                _set_variable(surf.ThicknessCell, False)
+        elif req.thickness_variable is not None:
+            _set_variable(surf.ThicknessCell, req.thickness_variable)
         return {"status": "ok", "data": _extract_system_state(oss)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.post("/quick_focus")
+def quick_focus():
+    try:
+        oss = zm.connect()
+        qf = oss.Tools.OpenQuickFocus()
+        if qf is None:
+            raise RuntimeError("无法打开快速聚焦工具，请检查是否有其他工具正在运行")
+        try:
+            criterion = getattr(
+                getattr(zp.constants.Tools, "General", None),
+                "QuickFocusCriterion",
+                getattr(zp.constants.Tools, "QuickFocusCriterion", None)
+            )
+            if criterion is not None and hasattr(criterion, "SpotSizeRadial"):
+                qf.Criterion = criterion.SpotSizeRadial
+            if hasattr(qf, "UseCentroid"):
+                qf.UseCentroid = True
+            qf.RunAndWaitForCompletion()
+            if hasattr(qf, "Succeeded") and not qf.Succeeded:
+                raise RuntimeError(str(getattr(qf, "ErrorMessage", "快速聚焦未成功")))
+        finally:
+            qf.Close()
+        return {"status": "ok", "message": "快速聚焦完成", "data": _extract_system_state(oss)}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 @app.post("/optimize")
 def run_optimization(req: OptimizeRequest):
@@ -340,51 +421,78 @@ def run_optimization(req: OptimizeRequest):
             if not hasattr(op_enum, op_name):
                 return {"status": "error", "message": f"未知的操作数名称: {op_name}"}
 
-        wizard = mfe.SEQOptimizationWizard
-        wizard.Type = 0
-        wizard.Data = 0 if req.use_wavefront else 1
-        wizard.OverallWeight = 1.0
-        wizard.IsGlassUsed = True
-        wizard.GlassMin = 2.0
-        wizard.GlassMax = 30.0
-        wizard.GlassEdge = 1.5
-        wizard.IsAirUsed = True
-        wizard.AirMin = 0.5
-        wizard.AirMax = 500.0
-        wizard.AirEdge = 0.5
-        # 每次按本次请求重建，避免向导保留 DMFS 上方的旧约束并重复累积。
-        if mfe.NumberOfOperands > 0:
-            mfe.RemoveOperandsAt(1, mfe.NumberOfOperands)
-        wizard.StartAt = 1
-        wizard.IsAddFavoriteOperandsUsed = False
-        wizard.Apply()
+        if getattr(req, "use_trac_spherical_mf", False):
+            # 讲义专用：跳过默认 Wizard，直接清空并构建 6个 TRAC + MNCA + MXCA + EFFL
+            if mfe.NumberOfOperands > 0:
+                mfe.RemoveOperandsAt(1, mfe.NumberOfOperands)
+            curr_row = 1
+            # 第 1~6 行：TRAC 操作数 (6 个归一化入瞳孔径带 Py)
+            py_list = [0.0, 0.3, 0.5, 0.7, 0.85, 1.0]
+            for py in py_list:
+                _insert_operand_row(mfe, curr_row, op_enum.TRAC, 0.0, 1.0,
+                                    int1=prim_wl, data1=0.0, data2=0.0, data3=0.0, data4=py)
+                curr_row += 1
+            # 第 7 行：MNCA 最小空气厚度约束 (面1到面3，Target=0.1, Weight=1.0)
+            _insert_operand_row(mfe, curr_row, op_enum.MNCA, 0.1, 1.0, int1=1, int2=3)
+            curr_row += 1
+            # 第 8 行：MXCA 最大空气厚度约束 (面1到面3，Target=50.0, Weight=1.0)
+            _insert_operand_row(mfe, curr_row, op_enum.MXCA, 50.0, 1.0, int1=1, int2=3)
+            curr_row += 1
+            # 第 9 行：EFFL 目标焦距约束
+            target_effl = req.target_effl if req.target_effl is not None else 70.0
+            _insert_operand_row(mfe, curr_row, op_enum.EFFL, target_effl, req.effl_weight, int2=prim_wl)
+            curr_row += 1
+            for item in req.custom_operands:
+                op_name = item.operand_type.upper().strip()
+                _insert_operand_row(mfe, curr_row, getattr(op_enum, op_name), item.target, item.weight,
+                                    item.int1, item.int2, item.data1, item.data2)
+                curr_row += 1
+        else:
+            wizard = mfe.SEQOptimizationWizard
+            wizard.Type = 0
+            wizard.Data = 0 if req.use_wavefront else 1
+            wizard.OverallWeight = 1.0
+            wizard.IsGlassUsed = True
+            wizard.GlassMin = 2.0
+            wizard.GlassMax = 30.0
+            wizard.GlassEdge = 1.5
+            wizard.IsAirUsed = True
+            wizard.AirMin = 0.5
+            wizard.AirMax = 500.0
+            wizard.AirEdge = 0.5
+            # 每次按本次请求重建，避免向导保留 DMFS 上方的旧约束并重复累积。
+            if mfe.NumberOfOperands > 0:
+                mfe.RemoveOperandsAt(1, mfe.NumberOfOperands)
+            wizard.StartAt = 1
+            wizard.IsAddFavoriteOperandsUsed = False
+            wizard.Apply()
 
-        curr_row = 1
-        if req.target_effl is not None:
-            _insert_operand_row(mfe, curr_row, op_enum.EFFL, req.target_effl, req.effl_weight, int2=prim_wl)
-            curr_row += 1
-        if req.minimize_axial_color:
-            _insert_operand_row(mfe, curr_row, op_enum.AXCL, 0.0, 5.0, int1=1, int2=oss.SystemData.Wavelengths.NumberOfWavelengths)
-            curr_row += 1
-        if req.max_totr is not None:
-            totr_row = curr_row
-            _insert_operand_row(mfe, totr_row, op_enum.TOTR, 0.0, 0.0)
-            curr_row += 1
-            _insert_operand_row(mfe, curr_row, op_enum.OPLT, req.max_totr, 5.0, int1=totr_row)
-            curr_row += 1
-        if req.min_bfl is not None:
-            last_surf_idx = oss.LDE.NumberOfSurfaces - 2
-            if last_surf_idx >= 1:
-                tthi_row = curr_row
-                _insert_operand_row(mfe, tthi_row, op_enum.TTHI, 0.0, 0.0, int1=last_surf_idx, int2=last_surf_idx)
+            curr_row = 1
+            if req.target_effl is not None:
+                _insert_operand_row(mfe, curr_row, op_enum.EFFL, req.target_effl, req.effl_weight, int2=prim_wl)
                 curr_row += 1
-                _insert_operand_row(mfe, curr_row, op_enum.OPGT, req.min_bfl, 5.0, int1=tthi_row)
+            if req.minimize_axial_color:
+                _insert_operand_row(mfe, curr_row, op_enum.AXCL, 0.0, 5.0, int1=1, int2=oss.SystemData.Wavelengths.NumberOfWavelengths)
                 curr_row += 1
-        for item in req.custom_operands:
-            op_name = item.operand_type.upper().strip()
-            _insert_operand_row(mfe, curr_row, getattr(op_enum, op_name), item.target, item.weight,
-                                item.int1, item.int2, item.data1, item.data2)
-            curr_row += 1
+            if req.max_totr is not None:
+                totr_row = curr_row
+                _insert_operand_row(mfe, totr_row, op_enum.TOTR, 0.0, 0.0)
+                curr_row += 1
+                _insert_operand_row(mfe, curr_row, op_enum.OPLT, req.max_totr, 5.0, int1=totr_row)
+                curr_row += 1
+            if req.min_bfl is not None:
+                last_surf_idx = oss.LDE.NumberOfSurfaces - 2
+                if last_surf_idx >= 1:
+                    tthi_row = curr_row
+                    _insert_operand_row(mfe, tthi_row, op_enum.TTHI, 0.0, 0.0, int1=last_surf_idx, int2=last_surf_idx)
+                    curr_row += 1
+                    _insert_operand_row(mfe, curr_row, op_enum.OPGT, req.min_bfl, 5.0, int1=tthi_row)
+                    curr_row += 1
+            for item in req.custom_operands:
+                op_name = item.operand_type.upper().strip()
+                _insert_operand_row(mfe, curr_row, getattr(op_enum, op_name), item.target, item.weight,
+                                    item.int1, item.int2, item.data1, item.data2)
+                curr_row += 1
 
         initial_mf = float(mfe.CalculateMeritFunction())
         if initial_mf > 1e6:

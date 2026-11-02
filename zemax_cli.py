@@ -28,6 +28,7 @@ def main():
     p_patch.add_argument("--material", type=str, help="玻璃材料")
     p_patch.add_argument("--var-r", type=int, choices=[0, 1], help="曲率半径是否设为变量(1是,0否)")
     p_patch.add_argument("--var-t", type=int, choices=[0, 1], help="厚度是否设为变量(1是,0否)")
+    p_patch.add_argument("--marginal-ray-height", action="store_true", help="将该面厚度设置为边缘光线高度求解 (MarginalRayHeight, Height=0.0, PupilZone=0.0)")
     p_aperture = p_patch.add_mutually_exclusive_group()
     p_aperture.add_argument("--semi-diameter", type=float, help="固定半口径(mm)，必须为正数，通常优先使用自动半口径")
     p_aperture.add_argument("--semi-diameter-auto", action="store_true", help="恢复半口径 Automatic 求解")
@@ -42,6 +43,7 @@ def main():
     p_opt.add_argument("--max-totr", type=float, help="限制系统最大总长 TOTR <= 该值 (mm)")
     p_opt.add_argument("--min-bfl", type=float, help="限制最小后工作距/后截距 >= 该值 (mm)")
     p_opt.add_argument("--achromatic", action="store_true", help="加入 AXCL 强制消除轴向色差")
+    p_opt.add_argument("--trac-mf", action="store_true", help="使用讲义专用的 6 孔径带 TRAC + MNCA + MXCA + EFFL 评价函数")
     p_opt.add_argument("--custom-op", type=str, help="额外自定义操作数 JSON 数组字符串")
 
     # 6. evaluate
@@ -53,6 +55,9 @@ def main():
     # 7. save
     p_save = subparsers.add_parser("save", help="保存镜头文件")
     p_save.add_argument("filepath", help="保存的 .zmx 路径")
+
+    # 8. quick_focus
+    subparsers.add_parser("quick_focus", help="调用 QuickFocus 工具寻找最佳像面位置")
 
     args = parser.parse_args()
 
@@ -75,6 +80,7 @@ def main():
             if args.material is not None: payload["material"] = args.material
             if args.var_r is not None: payload["radius_variable"] = bool(args.var_r)
             if args.var_t is not None: payload["thickness_variable"] = bool(args.var_t)
+            if args.marginal_ray_height: payload["marginal_ray_height_solve"] = True
             if args.semi_diameter is not None: payload["semi_diameter"] = args.semi_diameter
             if args.semi_diameter_auto: payload["semi_diameter_auto"] = True
             if args.stop: payload["is_stop"] = True
@@ -84,7 +90,8 @@ def main():
                 "cycles": args.cycles,
                 "use_wavefront": args.wavefront,
                 "effl_weight": args.effl_weight,
-                "minimize_axial_color": args.achromatic
+                "minimize_axial_color": args.achromatic,
+                "use_trac_spherical_mf": args.trac_mf
             }
             if args.effl is not None: payload["target_effl"] = args.effl
             if args.max_totr is not None: payload["max_totr"] = args.max_totr
@@ -98,6 +105,8 @@ def main():
             })
         elif args.command == "save":
             resp = requests.post(f"{SERVER_URL}/save", json={"filepath": args.filepath})
+        elif args.command == "quick_focus":
+            resp = requests.post(f"{SERVER_URL}/quick_focus")
 
         print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
     except requests.exceptions.ConnectionError:

@@ -16,7 +16,7 @@ SOURCE = (ROOT / "zemax_server.py").read_text(encoding="utf-8")
 HELPERS = {
     "_insert_operand_row", "_get_primary_wavelength_index",
     "_get_rms_spot_radii", "_json_safe_state", "_extract_system_state",
-    "_get_normalized_field_coordinates",
+    "_get_normalized_field_coordinates", "_set_marginal_ray_height_solve",
 }
 TREE = ast.parse(SOURCE)
 NAMESPACE = {"math": math, "Dict": dict, "Any": object}
@@ -148,7 +148,7 @@ def surface_patch_fixture(**changes):
     )
     params = dict(surface_index=1, radius=None, thickness=None, material=None,
                   radius_variable=None, thickness_variable=None, semi_diameter=None,
-                  semi_diameter_auto=False, is_stop=None)
+                  semi_diameter_auto=False, is_stop=None, marginal_ray_height_solve=None)
     params.update(changes)
     return route, SimpleNamespace(**params), surf, cell, editors
 
@@ -236,8 +236,10 @@ class CompatibilityTests(unittest.TestCase):
         manager.connect.assert_not_called()
 
     def test_operand_cells_receive_enum_members(self):
-        columns = SimpleNamespace(**{f"Param{i}": object() for i in range(1, 5)})
-        cells = {getattr(columns, f"Param{i}"): SimpleNamespace() for i in range(1, 5)}
+        columns = SimpleNamespace(**{f"Param{i}": object() for i in range(1, 7)})
+        cells = {getattr(columns, f"Param{i}"): SimpleNamespace() for i in range(1, 7)}
+        cells[6] = cells[columns.Param5]
+        cells[7] = cells[columns.Param6]
         row = SimpleNamespace(ChangeType=lambda _: None, GetOperandCell=lambda col: cells[col])
         mfe = SimpleNamespace(InsertNewOperandAt=lambda _: row)
         old_zp = NAMESPACE.get("zp")
@@ -245,7 +247,7 @@ class CompatibilityTests(unittest.TestCase):
             Editors=SimpleNamespace(MFE=SimpleNamespace(MeritColumn=columns))
         ))
         try:
-            result = NAMESPACE["_insert_operand_row"](mfe, 1, object(), 100, 10, 1, 2, 3.5, 4.5)
+            result = NAMESPACE["_insert_operand_row"](mfe, 1, object(), 100, 10, 1, 2, 3.5, 4.5, 0.0, 0.85)
         finally:
             if old_zp is None:
                 del NAMESPACE["zp"]
@@ -258,6 +260,8 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(cells[columns.Param2].IntegerValue, 2)
         self.assertEqual(cells[columns.Param3].DoubleValue, 3.5)
         self.assertEqual(cells[columns.Param4].DoubleValue, 4.5)
+        self.assertEqual(cells[columns.Param5].DoubleValue, 0.0)
+        self.assertEqual(cells[columns.Param6].DoubleValue, 0.85)
 
     def test_normalized_field_coordinates(self):
         modes = SimpleNamespace(Radial=object(), Rectangular=object())
@@ -585,6 +589,183 @@ class CompatibilityTests(unittest.TestCase):
         json.dumps(state, allow_nan=False)
         oss.MFE = SimpleNamespace(CalculateMeritFunction=lambda: 9e9)
         self.assertFalse(NAMESPACE["_extract_system_state"](oss)["ray_trace_valid"])
+
+    def test_marginal_ray_height_solve_helper(self):
+        solve_obj = SimpleNamespace(_S_MarginalRayHeight=SimpleNamespace(Height=10.0, PupilZone=0.5))
+        cell = Mock()
+        cell.CreateSolveType.return_value = solve_obj
+        solve_type_obj = object()
+        fake_zp = SimpleNamespace(constants=SimpleNamespace(
+            Editors=SimpleNamespace(SolveType=SimpleNamespace(MarginalRayHeight=solve_type_obj))
+        ))
+        with patch.dict(NAMESPACE, zp=fake_zp):
+            NAMESPACE["_set_marginal_ray_height_solve"](cell, height=0.0, pupil_zone=0.0)
+        cell.CreateSolveType.assert_called_once_with(solve_type_obj)
+        self.assertEqual(solve_obj._S_MarginalRayHeight.Height, 0.0)
+        self.assertEqual(solve_obj._S_MarginalRayHeight.PupilZone, 0.0)
+        cell.SetSolveData.assert_called_once_with(solve_obj)
+
+    def test_pydantic_models_for_experiment5(self):
+        from pydantic import BaseModel, Field
+        from typing import Optional, List
+        names = ["SurfaceItem", "SystemBuildRequest", "SurfacePatchRequest", "OptimizeRequest", "CustomOperandItem"]
+        nodes = [node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name in names]
+        namespace = {"BaseModel": BaseModel, "Field": Field, "Optional": Optional, "List": List}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<models-exp5>", "exec"), namespace)
+
+        # 1. SystemBuildRequest 默认 HeNe_0p6328
+        build_req = namespace["SystemBuildRequest"](epd=35.0, surfaces=[])
+        self.assertEqual(build_req.wavelength_preset, "HeNe_0p6328")
+        build_req2 = namespace["SystemBuildRequest"](epd=35.0, surfaces=[], wavelength_preset="FdC_Visible")
+        self.assertEqual(build_req2.wavelength_preset, "FdC_Visible")
+
+        # 2. SurfaceItem 支持 marginal_ray_height_solve
+        surf_item = namespace["SurfaceItem"](comment="test", radius=100.0, thickness=5.0, material="N-BK7", marginal_ray_height_solve=True)
+        self.assertTrue(surf_item.marginal_ray_height_solve)
+
+        # 3. SurfacePatchRequest 支持 marginal_ray_height_solve
+        patch_req = namespace["SurfacePatchRequest"](surface_index=2, marginal_ray_height_solve=True)
+        self.assertTrue(patch_req.marginal_ray_height_solve)
+
+        # 4. OptimizeRequest 支持 use_trac_spherical_mf
+        opt_req = namespace["OptimizeRequest"]()
+        self.assertFalse(opt_req.use_trac_spherical_mf)
+        opt_req_trac = namespace["OptimizeRequest"](use_trac_spherical_mf=True, target_effl=70.0)
+        self.assertTrue(opt_req_trac.use_trac_spherical_mf)
+        self.assertEqual(opt_req_trac.target_effl, 70.0)
+
+    def test_trac_optimization_rebuilds_merit_function(self):
+        operands = SimpleNamespace(**{name: name for name in ("TRAC", "MNCA", "MXCA", "EFFL", "TOTR")})
+        modes = SimpleNamespace(Automatic=object(), Fixed_10_Cycles=object())
+        fake_zp = SimpleNamespace(constants=SimpleNamespace(
+            Editors=SimpleNamespace(MFE=SimpleNamespace(MeritOperandType=operands)),
+            Tools=SimpleNamespace(Optimization=SimpleNamespace(
+                OptimizationAlgorithm=SimpleNamespace(DampedLeastSquares=object()), OptimizationCycles=modes,
+            )),
+        ))
+        rows = ["old row 1", "old row 2"]
+        class MeritFunction:
+            SEQOptimizationWizard = SimpleNamespace(Apply=Mock())
+            @property
+            def NumberOfOperands(self):
+                return len(rows)
+            def RemoveOperandsAt(self, start, count):
+                del rows[start - 1:start - 1 + count]
+            def CalculateMeritFunction(self):
+                return 0.05
+            def GetOperandValue(self, operand, *_):
+                return 70.0
+        mfe = MeritFunction()
+        inserted_ops = []
+        def insert(mfe, index, operand, target, weight, int1=None, int2=None, data1=None, data2=None, data3=None, data4=None):
+            inserted_ops.append((operand, target, weight, int1, int2, data1, data2, data3, data4))
+            rows.insert(index - 1, operand)
+
+        tool = SpotTool()
+        oss = SimpleNamespace(
+            MFE=mfe, LDE=SimpleNamespace(NumberOfSurfaces=4),
+            SystemData=SimpleNamespace(Wavelengths=SimpleNamespace(NumberOfWavelengths=1)),
+            Tools=SimpleNamespace(OpenLocalOptimization=lambda: tool),
+        )
+        optimize = server_function(
+            "run_optimization", zp=fake_zp, zm=SimpleNamespace(connect=lambda: oss), OptimizeRequest=object,
+            _get_primary_wavelength_index=lambda _: 1, _insert_operand_row=insert, _extract_system_state=lambda _: {},
+        )
+        req = SimpleNamespace(use_trac_spherical_mf=True, target_effl=70.0, effl_weight=10.0,
+                              use_wavefront=False, minimize_axial_color=False, max_totr=None, min_bfl=None,
+                              custom_operands=[], cycles=0)
+        res = optimize(req)
+        self.assertEqual(res["status"], "ok")
+        # 验证 Wizard 未被调用
+        mfe.SEQOptimizationWizard.Apply.assert_not_called()
+        # 验证插入了 9 行操作数
+        self.assertEqual(len(inserted_ops), 9)
+        # 前 6 行为 TRAC (6 个 Py 孔径带)
+        expected_pys = [0.0, 0.3, 0.5, 0.7, 0.85, 1.0]
+        for i, py in enumerate(expected_pys):
+            op, target, weight, int1, int2, d1, d2, d3, d4 = inserted_ops[i]
+            self.assertEqual(op, "TRAC")
+            self.assertEqual(target, 0.0)
+            self.assertEqual(weight, 1.0)
+            self.assertEqual(int1, 1)  # prim_wl
+            self.assertEqual(d4, py)   # Py
+        # 第 7 行 MNCA
+        self.assertEqual(inserted_ops[6], ("MNCA", 0.1, 1.0, 1, 3, None, None, None, None))
+        # 第 8 行 MXCA
+        self.assertEqual(inserted_ops[7], ("MXCA", 50.0, 1.0, 1, 3, None, None, None, None))
+        # 第 9 行 EFFL
+        self.assertEqual(inserted_ops[8], ("EFFL", 70.0, 10.0, None, 1, None, None, None, None))
+        self.assertTrue(tool.closed)
+
+    def test_cli_experiment5_commands_and_flags(self):
+        import argparse
+        source = (ROOT / "zemax_cli.py").read_text(encoding="utf-8")
+        node = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        requests = Mock()
+        requests.post.return_value.json.return_value = {"status": "ok"}
+        namespace = {"argparse": argparse, "json": json, "requests": requests, "SERVER_URL": "http://127.0.0.1:8765"}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<cli-main>", "exec"), namespace)
+
+        # 1. quick_focus
+        with patch.object(sys, "argv", ["zemax_cli.py", "quick_focus"]), patch("builtins.print"):
+            namespace["main"]()
+        requests.post.assert_called_with("http://127.0.0.1:8765/quick_focus")
+
+        # 2. patch --marginal-ray-height
+        requests.post.reset_mock()
+        with patch.object(sys, "argv", ["zemax_cli.py", "patch", "--index", "3", "--marginal-ray-height"]), patch("builtins.print"):
+            namespace["main"]()
+        requests.post.assert_called_with("http://127.0.0.1:8765/patch_surface", json={"surface_index": 3, "marginal_ray_height_solve": True})
+
+        # 3. optimize --trac-mf --effl 70.0
+        requests.post.reset_mock()
+        with patch.object(sys, "argv", ["zemax_cli.py", "optimize", "--trac-mf", "--effl", "70.0"]), patch("builtins.print"):
+            namespace["main"]()
+        requests.post.assert_called_with("http://127.0.0.1:8765/optimize", json={
+            "cycles": 0, "use_wavefront": False, "effl_weight": 10.0, "minimize_axial_color": False,
+            "use_trac_spherical_mf": True, "target_effl": 70.0
+        })
+
+    def test_quick_focus_route(self):
+        tool = SimpleNamespace(
+            Criterion=None, UseCentroid=False, Succeeded=True, closed=False,
+            RunAndWaitForCompletion=Mock(),
+            Close=lambda: setattr(tool, "closed", True)
+        )
+        fake_zp = SimpleNamespace(constants=SimpleNamespace(
+            Tools=SimpleNamespace(General=SimpleNamespace(
+                QuickFocusCriterion=SimpleNamespace(SpotSizeRadial="SpotSizeRadialVal")
+            ))
+        ))
+        oss = SimpleNamespace(Tools=SimpleNamespace(OpenQuickFocus=lambda: tool))
+        qf_route = server_function(
+            "quick_focus", zp=fake_zp, zm=SimpleNamespace(connect=lambda: oss),
+            _extract_system_state=lambda _: {"focus": "ok"}
+        )
+        res = qf_route()
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(tool.Criterion, "SpotSizeRadialVal")
+        self.assertTrue(tool.UseCentroid)
+        tool.RunAndWaitForCompletion.assert_called_once()
+        self.assertTrue(tool.closed)
+
+    def test_extract_system_state_geo_spot_radius(self):
+        surface = SimpleNamespace(Radius=100.0, Thickness=5.0, Material="N-BK7", SemiDiameter=12.5, Comment="", IsStop=False)
+        oss = with_tool(SpotTool())
+        oss.LDE = SimpleNamespace(NumberOfSurfaces=1, GetSurfaceAt=lambda _: surface)
+        oss.MFE = SimpleNamespace(
+            CalculateMeritFunction=lambda: 0.1,
+            GetOperandValue=lambda op, p1, p2, p3, p4, p5, py, *args: 0.0012 * py  # param6 (cell 7) is py, max at py=1.0 is 0.0012 mm -> 1.2 um
+        )
+        fake_zp = SimpleNamespace(constants=SimpleNamespace(
+            Editors=SimpleNamespace(MFE=SimpleNamespace(MeritOperandType=SimpleNamespace(TRAC="TRAC_OP")))
+        ))
+        with patch.dict(NAMESPACE, zp=fake_zp, _get_primary_wavelength_index=lambda _: 1):
+            state = NAMESPACE["_extract_system_state"](oss)
+        self.assertTrue(state["ray_trace_valid"])
+        self.assertEqual(state["geo_spot_radius_um"], 1.2)
+        self.assertEqual(state["geo_spot_diameter_um"], 2.4)
+        json.dumps(state, allow_nan=False)
 
 
 if __name__ == "__main__":
