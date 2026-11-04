@@ -59,6 +59,18 @@ def main():
     # 8. quick_focus
     subparsers.add_parser("quick_focus", help="调用 QuickFocus 工具寻找最佳像面位置")
 
+    # 9. tune
+    p_tune = subparsers.add_parser("tune", help="在指定范围内对某一表面参数进行快速自动扫描调参并反馈")
+    p_tune.add_argument("--index", type=int, required=True, help="表面序号 (从1开始)")
+    p_tune.add_argument("--param", type=str, required=True, choices=["radius", "thickness", "semi_diameter"], help="调参变量类型")
+    p_tune.add_argument("--min", type=float, required=True, dest="min_val", help="扫描起始/最小值")
+    p_tune.add_argument("--max", type=float, required=True, dest="max_val", help="扫描终止/最大值")
+    p_tune.add_argument("--steps", type=int, default=10, help="采样点数 (默认 10，2~100)")
+    p_tune.add_argument("--criterion", type=str, default="geo_spot", choices=["geo_spot", "rms_spot", "merit_function", "effl_diff"], help="寻优目标 (默认 geo_spot)")
+    p_tune.add_argument("--target-effl", type=float, default=None, help="若 criterion 为 effl_diff 时的目标焦距 (mm)")
+    p_tune.add_argument("--quick-focus", action="store_true", help="每个采样点后自动执行快速对焦")
+    p_tune.add_argument("--apply-best", action="store_true", help="自动将最优参数应用到当前系统中")
+
     args = parser.parse_args()
 
     try:
@@ -107,6 +119,20 @@ def main():
             resp = requests.post(f"{SERVER_URL}/save", json={"filepath": args.filepath})
         elif args.command == "quick_focus":
             resp = requests.post(f"{SERVER_URL}/quick_focus")
+        elif args.command == "tune":
+            payload = {
+                "surface_index": args.index,
+                "parameter": args.param,
+                "min_value": args.min_val,
+                "max_value": args.max_val,
+                "steps": args.steps,
+                "criterion": args.criterion,
+                "quick_focus": args.quick_focus,
+                "apply_best": args.apply_best
+            }
+            if args.target_effl is not None:
+                payload["target_effl"] = args.target_effl
+            resp = requests.post(f"{SERVER_URL}/tune", json=payload)
 
         print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
     except requests.exceptions.ConnectionError:

@@ -11,6 +11,8 @@
 5. **带物理约束优化**：`python zemax_cli.py optimize --effl 100.0 --max-totr 150.0 --achromatic --wavefront`
 6. **深度像质评估 (MTF & 波前)**：`python zemax_cli.py evaluate --max-freq 50 --points 5`
 7. **保存结果文件**：`python zemax_cli.py save outputs/final_design.zmx`
+8. **快速自动扫描调参 (单面参数自动寻优)**：`python zemax_cli.py tune --index 1 --param radius --min 50.0 --max 80.0 --steps 7 --criterion geo_spot --apply-best`；或调用专用的两阶段自适应调参器 `python zemax_tuner.py --index 1 --param radius --min 50.0 --max 80.0 --steps 7 --two-stage --apply-best`。
+   > **调参红线**：严禁大模型自己一轮轮单步修改参数手动盲猜！当需要探测曲率半径、中心厚度或空气间隔的灵敏度与最优值时，必须直接调用 `tune` 或 `zemax_tuner.py` 进行区间扫描。系统自带沙箱回滚保护，仅在指定 `--apply-best` 时写入最佳参数。
 
 ### `build` 命令 JSON 格式规范：
 - 平面（无穷大曲率半径）必须填 `"radius": 0.0`。

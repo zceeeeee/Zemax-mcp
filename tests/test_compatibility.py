@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import traceback
 from types import SimpleNamespace
+from typing import Dict, Any, List, Optional
 import unittest
 from unittest.mock import Mock, patch
 
@@ -17,9 +18,10 @@ HELPERS = {
     "_insert_operand_row", "_get_primary_wavelength_index",
     "_get_rms_spot_radii", "_json_safe_state", "_extract_system_state",
     "_get_normalized_field_coordinates", "_set_marginal_ray_height_solve",
+    "_analyze_sweep_trend",
 }
 TREE = ast.parse(SOURCE)
-NAMESPACE = {"math": math, "Dict": dict, "Any": object}
+NAMESPACE = {"math": math, "Dict": dict, "Any": object, "List": list, "Optional": Optional}
 exec(compile(ast.Module(body=[
     node for node in TREE.body
     if isinstance(node, ast.FunctionDef) and node.name in HELPERS
@@ -84,8 +86,8 @@ def validation_app():
                      Request=Request, RequestValidationError=RequestValidationError,
                      JSONResponse=JSONResponse, jsonable_encoder=jsonable_encoder, zm=Mock())
     namespace["zm"].connect.side_effect = AssertionError("Validation must reject input before connecting")
-    names = {"SurfacePatchRequest", "EvaluateRequest", "request_validation_error_handler",
-             "patch_surface", "evaluate_image_quality"}
+    names = {"SurfacePatchRequest", "EvaluateRequest", "ParameterTuneRequest", "request_validation_error_handler",
+             "patch_surface", "evaluate_image_quality", "tune_parameter"}
     nodes = [node for node in TREE.body
              if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<validation-app>", "exec"), namespace)
@@ -155,7 +157,7 @@ def surface_patch_fixture(**changes):
 
 class CompatibilityTests(unittest.TestCase):
     def test_syntax(self):
-        for filename in ("zemax_server.py", "zemax_cli.py"):
+        for filename in ("zemax_server.py", "zemax_cli.py", "zemax_tuner.py"):
             compile((ROOT / filename).read_text(encoding="utf-8"), filename, "exec")
 
     def test_primary_wavelength_uses_one_based_indices(self):
@@ -766,6 +768,200 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(state["geo_spot_radius_um"], 1.2)
         self.assertEqual(state["geo_spot_diameter_um"], 2.4)
         json.dumps(state, allow_nan=False)
+
+    def test_analyze_sweep_trend_scenarios(self):
+        trend_fn = NAMESPACE["_analyze_sweep_trend"]
+        # 1. All invalid
+        all_inv = [{"value": 10.0, "ray_trace_valid": False, "metric_value": None}]
+        t1 = trend_fn(all_inv, None, 10.0, 20.0)
+        self.assertEqual(t1["direction"], "all_invalid")
+        self.assertIsNone(t1["recommended_range"])
+
+        # 2. Single valid point
+        single_val = [
+            {"value": 10.0, "ray_trace_valid": False, "metric_value": None},
+            {"value": 15.0, "ray_trace_valid": True, "metric_value": 2.5},
+            {"value": 20.0, "ray_trace_valid": False, "metric_value": None},
+        ]
+        t2 = trend_fn(single_val, {"value": 15.0, "metric_value": 2.5}, 10.0, 20.0)
+        self.assertEqual(t2["direction"], "single_valid_point")
+        self.assertIsNotNone(t2["recommended_range"])
+
+        # 3. Monotonic min boundary
+        mono_min = [
+            {"value": 10.0, "ray_trace_valid": True, "metric_value": 1.0},
+            {"value": 15.0, "ray_trace_valid": True, "metric_value": 3.0},
+            {"value": 20.0, "ray_trace_valid": True, "metric_value": 5.0},
+        ]
+        t3 = trend_fn(mono_min, {"value": 10.0, "metric_value": 1.0}, 10.0, 20.0)
+        self.assertEqual(t3["direction"], "monotonic_boundary_min")
+
+        # 4. Monotonic max boundary
+        mono_max = [
+            {"value": 10.0, "ray_trace_valid": True, "metric_value": 5.0},
+            {"value": 15.0, "ray_trace_valid": True, "metric_value": 3.0},
+            {"value": 20.0, "ray_trace_valid": True, "metric_value": 1.0},
+        ]
+        t4 = trend_fn(mono_max, {"value": 20.0, "metric_value": 1.0}, 10.0, 20.0)
+        self.assertEqual(t4["direction"], "monotonic_boundary_max")
+
+        # 5. Interior minimum
+        interior = [
+            {"value": 10.0, "ray_trace_valid": True, "metric_value": 4.0},
+            {"value": 15.0, "ray_trace_valid": True, "metric_value": 1.5},
+            {"value": 20.0, "ray_trace_valid": True, "metric_value": 5.0},
+        ]
+        t5 = trend_fn(interior, {"value": 15.0, "metric_value": 1.5}, 10.0, 20.0)
+        self.assertEqual(t5["direction"], "interior_minimum")
+        self.assertEqual(t5["recommended_range"], [10.0, 20.0])
+
+    def test_parameter_tune_request_validation(self):
+        app, manager = validation_app()
+        # Invalid steps (< 2)
+        status, res = asyncio.run(asgi_post(app, "/tune", b'{"surface_index":1,"parameter":"radius","min_value":10,"max_value":20,"steps":1}'))
+        self.assertEqual(status, 422)
+        self.assertEqual(res["detail"][0]["loc"], ["body", "steps"])
+
+        # Invalid surface_index (< 1)
+        status, res = asyncio.run(asgi_post(app, "/tune", b'{"surface_index":0,"parameter":"radius","min_value":10,"max_value":20}'))
+        self.assertEqual(status, 422)
+        self.assertEqual(res["detail"][0]["loc"], ["body", "surface_index"])
+
+        # Nonfinite values rejected
+        status, res = asyncio.run(asgi_post(app, "/tune", b'{"surface_index":1,"parameter":"radius","min_value":1e309,"max_value":20}'))
+        self.assertEqual(status, 422)
+        self.assertEqual(res["detail"][0]["loc"], ["body", "min_value"])
+        manager.connect.assert_not_called()
+
+    def test_cli_tune_command_and_flags(self):
+        import argparse
+        source = (ROOT / "zemax_cli.py").read_text(encoding="utf-8")
+        node = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        requests = Mock()
+        requests.post.return_value.json.return_value = {"status": "ok"}
+        namespace = {"argparse": argparse, "json": json, "requests": requests, "SERVER_URL": "http://127.0.0.1:8765"}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<cli-main>", "exec"), namespace)
+
+        with patch.object(sys, "argv", [
+            "zemax_cli.py", "tune", "--index", "2", "--param", "thickness",
+            "--min", "1.5", "--max", "9.5", "--steps", "5",
+            "--criterion", "rms_spot", "--target-effl", "70.0",
+            "--quick-focus", "--apply-best"
+        ]), patch("builtins.print"):
+            namespace["main"]()
+        requests.post.assert_called_with("http://127.0.0.1:8765/tune", json={
+            "surface_index": 2,
+            "parameter": "thickness",
+            "min_value": 1.5,
+            "max_value": 9.5,
+            "steps": 5,
+            "criterion": "rms_spot",
+            "quick_focus": True,
+            "apply_best": True,
+            "target_effl": 70.0
+        })
+
+    def test_tune_parameter_route_logic(self):
+        surf1 = SimpleNamespace(Radius=60.0, Thickness=5.0, SemiDiameter=12.5)
+        surf2 = SimpleNamespace(Radius=0.0, Thickness=95.0, SemiDiameter=12.5)
+        surfaces = {1: surf1, 2: surf2}
+
+        oss = SimpleNamespace(
+            LDE=SimpleNamespace(NumberOfSurfaces=4, GetSurfaceAt=lambda idx: surfaces.get(idx, surf1)),
+            MFE=SimpleNamespace(
+                GetOperandValue=lambda *args: 70.0,
+                CalculateMeritFunction=lambda: 0.05
+            ),
+            Tools=SimpleNamespace()
+        )
+
+        def mock_extract(oss):
+            r = surf1.Radius
+            geo_spot = abs(r - 65.0) * 0.5 + 2.0  # Minimum at r=65.0 where geo_spot=2.0
+            return {
+                "ray_trace_valid": True,
+                "geo_spot_diameter_um": geo_spot,
+                "merit_function": 0.05,
+                "rms_spot_radius": [[0.002]]
+            }
+
+        fake_zp = SimpleNamespace(constants=SimpleNamespace(
+            Editors=SimpleNamespace(MFE=SimpleNamespace(MeritOperandType=SimpleNamespace(EFFL="EFFL_OP")))
+        ))
+
+        route = server_function(
+            "tune_parameter",
+            ParameterTuneRequest=object,
+            zm=SimpleNamespace(connect=lambda: oss),
+            zp=fake_zp,
+            _extract_system_state=mock_extract,
+            _get_primary_wavelength_index=lambda _: 1
+        )
+
+        # 1. apply_best=False -> should restore original Radius 60.0
+        req1 = SimpleNamespace(
+            surface_index=1, parameter="radius", min_value=55.0, max_value=75.0,
+            steps=5, criterion="geo_spot", target_effl=None, quick_focus=False, apply_best=False
+        )
+        res1 = route(req1)
+        self.assertEqual(res1["status"], "ok")
+        self.assertFalse(res1["applied"])
+        self.assertEqual(surf1.Radius, 60.0)  # Restored
+        self.assertEqual(res1["best_candidate"]["value"], 65.0)
+        self.assertEqual(res1["trend_analysis"]["direction"], "interior_minimum")
+
+        # 2. apply_best=True -> should update surf1.Radius to 65.0
+        req2 = SimpleNamespace(
+            surface_index=1, parameter="radius", min_value=55.0, max_value=75.0,
+            steps=5, criterion="geo_spot", target_effl=None, quick_focus=False, apply_best=True
+        )
+        res2 = route(req2)
+        self.assertEqual(res2["status"], "ok")
+        self.assertTrue(res2["applied"])
+        self.assertEqual(surf1.Radius, 65.0)  # Applied!
+
+    def test_zemax_tuner_script_helpers(self):
+        from zemax_tuner import render_ascii_report, two_stage_tune
+        mock_data = {
+            "status": "ok",
+            "surface_index": 1,
+            "parameter": "radius",
+            "original_value": 60.0,
+            "scan_range": {"min": 50.0, "max": 80.0, "steps": 4},
+            "criterion": "geo_spot",
+            "applied": True,
+            "valid_count": 4,
+            "invalid_count": 0,
+            "best_candidate": {"value": 65.0, "metric_value": 2.1, "geo_spot_diameter_um": 2.1, "effl_mm": 70.0},
+            "trend_analysis": {
+                "direction": "interior_minimum",
+                "summary": "存在明确凹陷点",
+                "recommended_range": [60.0, 70.0]
+            },
+            "all_results": [
+                {"value": 50.0, "ray_trace_valid": True, "metric_value": 8.0, "effl_mm": 60.0},
+                {"value": 60.0, "ray_trace_valid": True, "metric_value": 4.5, "effl_mm": 66.0},
+                {"value": 65.0, "ray_trace_valid": True, "metric_value": 2.1, "effl_mm": 70.0},
+                {"value": 80.0, "ray_trace_valid": True, "metric_value": 9.2, "effl_mm": 78.0},
+            ]
+        }
+        report = render_ascii_report(mock_data)
+        self.assertIn("Zemax 快速调参反馈报告", report)
+        self.assertIn("BEST", report)
+        self.assertIn("65.0", report)
+
+        with patch("zemax_tuner.call_tune_api") as mock_call:
+            mock_call.side_effect = [
+                mock_data,  # Stage 1
+                dict(mock_data, best_candidate={"value": 66.2, "metric_value": 1.8})  # Stage 2
+            ]
+            res = two_stage_tune(
+                surface_index=1, parameter="radius", min_value=50.0, max_value=80.0,
+                stage1_steps=4, stage2_steps=4, apply_best=True
+            )
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(res["tuning_mode"], "two_stage_zoom")
+            self.assertEqual(res["final_best"]["value"], 66.2)
 
 
 if __name__ == "__main__":

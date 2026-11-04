@@ -59,6 +59,8 @@ $env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
 - `build` 和 `load` 不再自动创建 2D Layout 分析窗口，可在 OpticStudio 中手动打开，避免重复调用时积累窗口；接口不会扫描或关闭已有分析窗口。
 - `patch --index 2 --semi-diameter-auto` 恢复该面的 Automatic 半口径求解；`--semi-diameter 10` 可设定固定半口径，两者互斥。自动半口径不会撤销表面已有的 aperture、机械口径或其他遮挡设置，恢复后应检查 `status` / `evaluate`。
 - `patch --index 2 --stop` 将光阑移动到指定的可编辑表面。HTTP 字段 `is_stop=false` 不能取消当前光阑，会返回错误；对非光阑面传入 false 是无操作。移动光阑应直接对替代表面指定 `--stop`。
+- `tune --index <面号> --param <radius|thickness|semi_diameter> --min <下界> --max <上界> [--steps 10] [--criterion geo_spot|rms_spot|merit_function|effl_diff] [--quick-focus] [--apply-best]`：在指定区间内快速自动调参。自带沙箱回滚机制，默认扫描评估完成后自动恢复测试前状态；显式指定 `--apply-best` 时才将最优候选值写入系统。可选 `--quick-focus` 在每个采样点自动执行快速对焦以消除离焦干扰。
+- 独立调参脚本 `zemax_tuner.py`：专为 Agent 快速寻优设计，支持 `--two-stage` 两阶段自适应精修（粗调定位极小值后自动缩减区间精调）、终端 ASCII 趋势分布图以及 `--json` 机器格式输出。
 
 更多设计规则参见 [CLAUDE.md](CLAUDE.md)。[项目部署与使用指南.md](项目部署与使用指南.md) 是初始部署参考，运行代码已包含后续接口兼容修正，应以当前代码为准。
 

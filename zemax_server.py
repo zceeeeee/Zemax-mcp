@@ -89,6 +89,17 @@ class EvaluateRequest(BaseModel):
     num_freq_points: int = Field(default=5, ge=1, description="频率采样点数量")
     mtf_sampling: int = Field(default=3, ge=1, le=4, strict=True, description="MTF 采样级别 (1–4)，Grid=0 使用稀疏积分，需逐级检查收敛")
 
+class ParameterTuneRequest(BaseModel):
+    surface_index: int = Field(ge=1, description="要修改的表面序号 (从1开始)")
+    parameter: str = Field(description="调参变量名称: 'radius' (曲率半径) 或 'thickness' (厚度/空气间隔) 或 'semi_diameter' (半口径)")
+    min_value: float = Field(allow_inf_nan=False, description="扫描起始/最小值")
+    max_value: float = Field(allow_inf_nan=False, description="扫描终止/最大值")
+    steps: int = Field(default=10, ge=2, le=100, description="采样点数 (默认 10 点，范围 2~100)")
+    criterion: str = Field(default="geo_spot", description="优化/择优目标: 'geo_spot', 'rms_spot', 'merit_function', 'effl_diff'")
+    target_effl: Optional[float] = Field(default=None, allow_inf_nan=False, description="若 criterion 为 'effl_diff' 时的目标焦距 (mm)")
+    quick_focus: bool = Field(default=False, description="每个采样点是否先执行快速聚焦")
+    apply_best: bool = Field(default=False, description="是否自动将表现最佳的参数应用到当前系统")
+
 class FileRequest(BaseModel):
     filepath: str = Field(description="完整文件路径 (.zmx)")
 
@@ -191,6 +202,64 @@ def _json_safe_state(value):
     if isinstance(value, (list, tuple)):
         return [_json_safe_state(item) for item in value]
     return value
+
+def _analyze_sweep_trend(results: List[Dict[str, Any]], best_candidate: Optional[Dict[str, Any]],
+                         min_val: float, max_val: float) -> Dict[str, Any]:
+    """分析调参扫描结果的灵敏度趋势并给出下一步推荐区间"""
+    valid_points = [r for r in results if r.get("ray_trace_valid") and r.get("metric_value") is not None]
+    valid_count = len(valid_points)
+
+    if valid_count == 0 or best_candidate is None:
+        return {
+            "direction": "all_invalid",
+            "summary": "所有扫描采样点光线追迹均失败 (全反射或严重切光)，无法形成有效像质评估。建议反转曲率方向或调整扫描区间。",
+            "recommended_range": None
+        }
+
+    best_val = best_candidate["value"]
+    best_metric = best_candidate["metric_value"]
+
+    if valid_count == 1:
+        step_delta = abs(max_val - min_val) * 0.1
+        return {
+            "direction": "single_valid_point",
+            "summary": f"仅在参数值 {best_val} 处光线追迹有效 (指标: {best_metric})，其余采样点均失效。建议以此点为中心缩小范围精细扫描。",
+            "recommended_range": [round(best_val - step_delta, 4), round(best_val + step_delta, 4)]
+        }
+
+    best_idx = None
+    for idx, r in enumerate(results):
+        if r["value"] == best_val:
+            best_idx = idx
+            break
+
+    n = len(results)
+    step_size = abs(max_val - min_val) / max(n - 1, 1)
+
+    if best_idx == 0:
+        rec_min = min_val - step_size * 2.0
+        rec_max = min_val + step_size
+        return {
+            "direction": "monotonic_boundary_min",
+            "summary": f"像质在起始边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
+            "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)]
+        }
+    elif best_idx == n - 1:
+        rec_min = max_val - step_size
+        rec_max = max_val + step_size * 2.0
+        return {
+            "direction": "monotonic_boundary_max",
+            "summary": f"像质在终止边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
+            "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)]
+        }
+    else:
+        prev_val = results[best_idx - 1]["value"]
+        next_val = results[best_idx + 1]["value"]
+        return {
+            "direction": "interior_minimum",
+            "summary": f"在参数值 {best_val} 处发现明确的像质最优极值点 (指标: {best_metric})，两侧像质均退化。此区域具备良好的局部收敛特征。",
+            "recommended_range": [round(min(prev_val, next_val), 4), round(max(prev_val, next_val), 4)]
+        }
 
 def _extract_system_state(oss) -> Dict[str, Any]:
     """安全提取当前镜头表面与光路健康度，绝不抛未捕获异常"""
@@ -601,6 +670,190 @@ def evaluate_image_quality(req: EvaluateRequest):
             "paraxial_specs": {"effective_focal_length_mm": round(effl, 3), "working_f_number": round(wfno, 3)},
             "wavefront_summary": wavefront_results,
             "mtf_summary": mtf_results
+        })
+    except Exception as e:
+        return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
+
+@app.post("/tune")
+def tune_parameter(req: ParameterTuneRequest):
+    try:
+        oss = zm.connect()
+        lde = oss.LDE
+        if req.surface_index < 1 or req.surface_index >= lde.NumberOfSurfaces - 1:
+            return {"status": "error", "message": f"表面序号 {req.surface_index} 超出可编辑范围 (1 至 {lde.NumberOfSurfaces - 2})"}
+
+        param = req.parameter.lower().strip()
+        if param not in ("radius", "thickness", "semi_diameter"):
+            return {"status": "error", "message": f"不支持的调参变量类型: '{req.parameter}'。仅支持 'radius', 'thickness', 'semi_diameter'"}
+
+        surf = lde.GetSurfaceAt(req.surface_index)
+        orig_val = getattr(surf, {"radius": "Radius", "thickness": "Thickness", "semi_diameter": "SemiDiameter"}[param])
+
+        last_surf_idx = lde.NumberOfSurfaces - 2
+        orig_last_thickness = lde.GetSurfaceAt(last_surf_idx).Thickness if last_surf_idx >= 1 else None
+
+        if req.steps <= 1:
+            test_values = [req.min_value]
+        else:
+            step_size = (req.max_value - req.min_value) / (req.steps - 1)
+            test_values = [req.min_value + i * step_size for i in range(req.steps)]
+
+        results = []
+        best_candidate = None
+        best_metric = float("inf")
+        best_last_thickness = None
+        applied = False
+
+        try:
+            for val in test_values:
+                # 1. 设置测试参数
+                if param == "radius":
+                    surf.Radius = float(val)
+                elif param == "thickness":
+                    surf.Thickness = float(val)
+                elif param == "semi_diameter":
+                    surf.SemiDiameter = float(val)
+
+                # 2. 可选快速聚焦
+                refocused_bfl = None
+                if req.quick_focus:
+                    try:
+                        qf = oss.Tools.OpenQuickFocus()
+                        if qf is not None:
+                            try:
+                                criterion = getattr(
+                                    getattr(zp.constants.Tools, "General", None),
+                                    "QuickFocusCriterion",
+                                    getattr(zp.constants.Tools, "QuickFocusCriterion", None)
+                                )
+                                if criterion is not None and hasattr(criterion, "SpotSizeRadial"):
+                                    qf.Criterion = criterion.SpotSizeRadial
+                                if hasattr(qf, "UseCentroid"):
+                                    qf.UseCentroid = True
+                                qf.RunAndWaitForCompletion()
+                            finally:
+                                qf.Close()
+                                if last_surf_idx >= 1:
+                                    refocused_bfl = round(float(lde.GetSurfaceAt(last_surf_idx).Thickness), 4)
+                    except Exception:
+                        pass
+
+                # 3. 提取光学状态与评价指标
+                state = _extract_system_state(oss)
+                ray_ok = bool(state.get("ray_trace_valid", False))
+
+                effl = None
+                try:
+                    prim_wl = _get_primary_wavelength_index(oss)
+                    op_effl = zp.constants.Editors.MFE.MeritOperandType.EFFL
+                    effl_val = float(oss.MFE.GetOperandValue(op_effl, 0, prim_wl, 0, 0.0, 0.0, 0.0, 0.0, 0.0))
+                    if math.isfinite(effl_val) and abs(effl_val) < 1e6:
+                        effl = round(effl_val, 4)
+                except Exception:
+                    pass
+
+                metric_val = None
+                if ray_ok:
+                    crit = req.criterion.lower().strip()
+                    if crit in ("geo_spot", "geo_spot_diameter_um"):
+                        metric_val = state.get("geo_spot_diameter_um")
+                    elif crit in ("rms_spot", "rms_spot_radius"):
+                        rms_mat = state.get("rms_spot_radius")
+                        if rms_mat and len(rms_mat) > 0 and len(rms_mat[0]) > 0:
+                            metric_val = round(rms_mat[0][0] * 1000.0, 4)
+                    elif crit in ("merit_function", "merit", "mf"):
+                        mf = state.get("merit_function")
+                        if mf is not None and math.isfinite(mf) and mf < 1e6:
+                            metric_val = round(mf, 6)
+                    elif crit in ("effl_diff", "effl"):
+                        if effl is not None and req.target_effl is not None:
+                            metric_val = round(abs(effl - req.target_effl), 4)
+
+                    if metric_val is None:
+                        metric_val = state.get("geo_spot_diameter_um") or state.get("merit_function")
+
+                item = {
+                    "value": round(float(val), 5),
+                    "ray_trace_valid": ray_ok,
+                    "metric_value": metric_val,
+                    "geo_spot_diameter_um": state.get("geo_spot_diameter_um"),
+                    "merit_function": state.get("merit_function"),
+                    "effl_mm": effl
+                }
+                if refocused_bfl is not None:
+                    item["refocused_bfl_mm"] = refocused_bfl
+
+                results.append(item)
+
+                if ray_ok and metric_val is not None and metric_val < best_metric:
+                    best_metric = metric_val
+                    best_candidate = item
+                    if req.quick_focus and last_surf_idx >= 1:
+                        best_last_thickness = lde.GetSurfaceAt(last_surf_idx).Thickness
+
+            # 应用最佳值或回滚现场
+            if req.apply_best and best_candidate is not None:
+                best_val = best_candidate["value"]
+                if param == "radius": surf.Radius = float(best_val)
+                elif param == "thickness": surf.Thickness = float(best_val)
+                elif param == "semi_diameter": surf.SemiDiameter = float(best_val)
+                if req.quick_focus and best_last_thickness is not None and last_surf_idx >= 1:
+                    lde.GetSurfaceAt(last_surf_idx).Thickness = float(best_last_thickness)
+                applied = True
+            else:
+                if param == "radius": surf.Radius = float(orig_val)
+                elif param == "thickness": surf.Thickness = float(orig_val)
+                elif param == "semi_diameter": surf.SemiDiameter = float(orig_val)
+                if req.quick_focus and orig_last_thickness is not None and last_surf_idx >= 1:
+                    lde.GetSurfaceAt(last_surf_idx).Thickness = float(orig_last_thickness)
+                applied = False
+
+        except Exception as loop_err:
+            if not applied:
+                try:
+                    if param == "radius": surf.Radius = float(orig_val)
+                    elif param == "thickness": surf.Thickness = float(orig_val)
+                    elif param == "semi_diameter": surf.SemiDiameter = float(orig_val)
+                    if req.quick_focus and orig_last_thickness is not None and last_surf_idx >= 1:
+                        lde.GetSurfaceAt(last_surf_idx).Thickness = float(orig_last_thickness)
+                except Exception:
+                    pass
+            raise loop_err
+
+        trend_info = _analyze_sweep_trend(results, best_candidate, req.min_value, req.max_value)
+        valid_candidates = [r for r in results if r["ray_trace_valid"] and r["metric_value"] is not None]
+        sorted_candidates = sorted(valid_candidates, key=lambda x: x["metric_value"])
+        top_candidates = [
+            {
+                "rank": idx + 1,
+                "value": cand["value"],
+                "metric_value": cand["metric_value"],
+                "geo_spot_diameter_um": cand.get("geo_spot_diameter_um"),
+                "effl_mm": cand.get("effl_mm")
+            }
+            for idx, cand in enumerate(sorted_candidates[:3])
+        ]
+
+        best_cand_out = None
+        if best_candidate is not None:
+            best_cand_out = dict(best_candidate)
+            best_cand_out["applied"] = applied
+
+        return _json_safe_state({
+            "status": "ok",
+            "surface_index": req.surface_index,
+            "parameter": param,
+            "original_value": round(float(orig_val), 5) if orig_val is not None else None,
+            "scan_range": {"min": req.min_value, "max": req.max_value, "steps": req.steps},
+            "criterion": req.criterion,
+            "quick_focus": req.quick_focus,
+            "applied": applied,
+            "valid_count": len(valid_candidates),
+            "invalid_count": len(results) - len(valid_candidates),
+            "best_candidate": best_cand_out,
+            "trend_analysis": trend_info,
+            "top_candidates": top_candidates,
+            "all_results": results
         })
     except Exception as e:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
