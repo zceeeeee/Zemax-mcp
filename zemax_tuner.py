@@ -20,6 +20,238 @@ from typing import Dict, Any, Optional, List
 SERVER_URL = "http://127.0.0.1:8765"
 
 
+def _analyze_client_trend(
+    results: List[Dict[str, Any]],
+    best_candidate: Optional[Dict[str, Any]],
+    min_val: float,
+    max_val: float,
+) -> Dict[str, Any]:
+    """客户端降级模式下的灵敏度与极值趋势诊断"""
+    valid_points = [r for r in results if r.get("ray_trace_valid") and r.get("metric_value") is not None]
+    valid_count = len(valid_points)
+
+    if valid_count == 0 or best_candidate is None:
+        return {
+            "direction": "all_invalid",
+            "summary": "所有扫描采样点光线追迹均失败 (全反射或严重切光)，无法形成有效像质评估。建议反转曲率方向或调整扫描区间。",
+            "recommended_range": None,
+        }
+
+    best_val = best_candidate["value"]
+    best_metric = best_candidate["metric_value"]
+
+    if valid_count == 1:
+        step_delta = abs(max_val - min_val) * 0.1
+        return {
+            "direction": "single_valid_point",
+            "summary": f"仅在参数值 {best_val} 处光线追迹有效 (指标: {best_metric})，其余采样点均失效。建议以此点为中心缩小范围精细扫描。",
+            "recommended_range": [round(best_val - step_delta, 4), round(best_val + step_delta, 4)],
+        }
+
+    best_idx = None
+    for idx, r in enumerate(results):
+        if r["value"] == best_val:
+            best_idx = idx
+            break
+
+    n = len(results)
+    step_size = abs(max_val - min_val) / max(n - 1, 1)
+
+    if best_idx == 0:
+        rec_min = min_val - step_size * 2.0
+        rec_max = min_val + step_size
+        return {
+            "direction": "monotonic_boundary_min",
+            "summary": f"像质在起始边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
+            "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)],
+        }
+    elif best_idx == n - 1:
+        rec_min = max_val - step_size
+        rec_max = max_val + step_size * 2.0
+        return {
+            "direction": "monotonic_boundary_max",
+            "summary": f"像质在终止边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
+            "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)],
+        }
+    else:
+        prev_val = results[best_idx - 1]["value"]
+        next_val = results[best_idx + 1]["value"]
+        return {
+            "direction": "interior_minimum",
+            "summary": f"在参数值 {best_val} 处发现明确的像质最优极值点 (指标: {best_metric})，两侧像质均退化。此区域具备良好的局部收敛特征。",
+            "recommended_range": [round(min(prev_val, next_val), 4), round(max(prev_val, next_val), 4)],
+        }
+
+
+def client_side_tune(
+    surface_index: int,
+    parameter: str,
+    min_value: float,
+    max_value: float,
+    steps: int = 10,
+    criterion: str = "geo_spot",
+    target_effl: Optional[float] = None,
+    quick_focus: bool = False,
+    apply_best: bool = False,
+    server_url: str = SERVER_URL,
+) -> Dict[str, Any]:
+    """
+    客户端无侵入回退方案：完全仅依赖原有的 /status 和 /patch_surface 接口，
+    即使服务端未重启或未添加 /tune 端点也能直接运行，且全程保证沙箱自动回滚。
+    """
+    resp_init = requests.get(f"{server_url}/status", timeout=10)
+    init_json = resp_init.json()
+    if init_json.get("status") != "ok":
+        return {"status": "error", "message": "无法获取当前系统状态", "detail": init_json}
+
+    surfaces = init_json.get("data", {}).get("surfaces", [])
+    target_surf = None
+    for s in surfaces:
+        if s.get("index") == surface_index:
+            target_surf = s
+            break
+    if not target_surf:
+        return {"status": "error", "message": f"未找到表面序号 {surface_index}"}
+
+    param_key = parameter.lower().strip()
+    orig_val = target_surf.get(param_key)
+    if orig_val is None:
+        return {"status": "error", "message": f"表面不存在属性: {parameter}"}
+
+    last_surf_idx = len(surfaces) - 2
+    orig_last_thickness = None
+    for s in surfaces:
+        if s.get("index") == last_surf_idx:
+            orig_last_thickness = s.get("thickness")
+            break
+
+    if steps <= 1:
+        test_values = [min_value]
+    else:
+        step_size = (max_value - min_value) / (steps - 1)
+        test_values = [min_value + i * step_size for i in range(steps)]
+
+    results = []
+    best_candidate = None
+    best_metric = float("inf")
+    best_last_thickness = None
+    applied = False
+
+    try:
+        for val in test_values:
+            patch_payload = {"surface_index": surface_index, param_key: float(val)}
+            requests.post(f"{server_url}/patch_surface", json=patch_payload, timeout=10)
+
+            refocused_bfl = None
+            if quick_focus:
+                try:
+                    qf_resp = requests.post(f"{server_url}/quick_focus", timeout=10).json()
+                    if qf_resp.get("status") == "ok":
+                        qf_surfs = qf_resp.get("data", {}).get("surfaces", [])
+                        for s in qf_surfs:
+                            if s.get("index") == last_surf_idx:
+                                refocused_bfl = s.get("thickness")
+                                break
+                except Exception:
+                    pass
+
+            st_resp = requests.get(f"{server_url}/status", timeout=10).json()
+            st_data = st_resp.get("data", {})
+            ray_ok = bool(st_data.get("ray_trace_valid", False))
+
+            metric_val = None
+            if ray_ok:
+                crit = criterion.lower().strip()
+                if crit in ("geo_spot", "geo_spot_diameter_um"):
+                    metric_val = st_data.get("geo_spot_diameter_um")
+                elif crit in ("rms_spot", "rms_spot_radius"):
+                    rms_mat = st_data.get("rms_spot_radius")
+                    if rms_mat and len(rms_mat) > 0 and len(rms_mat[0]) > 0:
+                        metric_val = round(rms_mat[0][0] * 1000.0, 4)
+                elif crit in ("merit_function", "merit", "mf"):
+                    mf = st_data.get("merit_function")
+                    if mf is not None and mf < 1e6:
+                        metric_val = round(mf, 6)
+
+                if metric_val is None:
+                    metric_val = st_data.get("geo_spot_diameter_um") or st_data.get("merit_function")
+
+            item = {
+                "value": round(float(val), 5),
+                "ray_trace_valid": ray_ok,
+                "metric_value": metric_val,
+                "geo_spot_diameter_um": st_data.get("geo_spot_diameter_um"),
+                "merit_function": st_data.get("merit_function"),
+            }
+            if refocused_bfl is not None:
+                item["refocused_bfl_mm"] = refocused_bfl
+
+            results.append(item)
+
+            if ray_ok and metric_val is not None and metric_val < best_metric:
+                best_metric = metric_val
+                best_candidate = item
+                best_last_thickness = refocused_bfl
+
+        if apply_best and best_candidate is not None:
+            best_val = best_candidate["value"]
+            requests.post(f"{server_url}/patch_surface", json={"surface_index": surface_index, param_key: float(best_val)}, timeout=10)
+            if quick_focus and best_last_thickness is not None and last_surf_idx >= 1:
+                requests.post(f"{server_url}/patch_surface", json={"surface_index": last_surf_idx, "thickness": float(best_last_thickness)}, timeout=10)
+            applied = True
+        else:
+            requests.post(f"{server_url}/patch_surface", json={"surface_index": surface_index, param_key: float(orig_val)}, timeout=10)
+            if quick_focus and orig_last_thickness is not None and last_surf_idx >= 1:
+                requests.post(f"{server_url}/patch_surface", json={"surface_index": last_surf_idx, "thickness": float(orig_last_thickness)}, timeout=10)
+            applied = False
+
+    except Exception as e:
+        if not applied:
+            try:
+                requests.post(f"{server_url}/patch_surface", json={"surface_index": surface_index, param_key: float(orig_val)}, timeout=5)
+                if quick_focus and orig_last_thickness is not None and last_surf_idx >= 1:
+                    requests.post(f"{server_url}/patch_surface", json={"surface_index": last_surf_idx, "thickness": float(orig_last_thickness)}, timeout=5)
+            except Exception:
+                pass
+        return {"status": "error", "message": f"客户端无侵入调参执行异常: {str(e)}"}
+
+    trend_info = _analyze_client_trend(results, best_candidate, min_value, max_value)
+    valid_candidates = [r for r in results if r["ray_trace_valid"] and r["metric_value"] is not None]
+    sorted_candidates = sorted(valid_candidates, key=lambda x: x["metric_value"])
+    top_candidates = [
+        {
+            "rank": idx + 1,
+            "value": cand["value"],
+            "metric_value": cand["metric_value"],
+            "geo_spot_diameter_um": cand.get("geo_spot_diameter_um"),
+        }
+        for idx, cand in enumerate(sorted_candidates[:3])
+    ]
+
+    best_cand_out = None
+    if best_candidate is not None:
+        best_cand_out = dict(best_candidate)
+        best_cand_out["applied"] = applied
+
+    return {
+        "status": "ok",
+        "surface_index": surface_index,
+        "parameter": parameter,
+        "original_value": orig_val,
+        "scan_range": {"min": min_value, "max": max_value, "steps": steps},
+        "criterion": criterion,
+        "quick_focus": quick_focus,
+        "applied": applied,
+        "valid_count": len(valid_candidates),
+        "invalid_count": len(results) - len(valid_candidates),
+        "best_candidate": best_cand_out,
+        "trend_analysis": trend_info,
+        "top_candidates": top_candidates,
+        "all_results": results,
+        "execution_mode": "client_side_fallback"
+    }
+
+
 def call_tune_api(
     surface_index: int,
     parameter: str,
@@ -32,7 +264,7 @@ def call_tune_api(
     apply_best: bool = False,
     server_url: str = SERVER_URL,
 ) -> Dict[str, Any]:
-    """调用服务端的 /tune 端点执行一次单阶段参数扫描"""
+    """优先调用服务端的 /tune 端点；若服务端未升级或返回 404，则自动无缝降级为无侵入客户端扫描"""
     payload = {
         "surface_index": surface_index,
         "parameter": parameter,
@@ -46,8 +278,28 @@ def call_tune_api(
     if target_effl is not None:
         payload["target_effl"] = target_effl
 
-    resp = requests.post(f"{server_url}/tune", json=payload, timeout=60)
-    return resp.json()
+    try:
+        resp = requests.post(f"{server_url}/tune", json=payload, timeout=60)
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 404:
+            # 服务端未更新该端点，自动无缝切换为客户端降级调参
+            return client_side_tune(
+                surface_index=surface_index,
+                parameter=parameter,
+                min_value=min_value,
+                max_value=max_value,
+                steps=steps,
+                criterion=criterion,
+                target_effl=target_effl,
+                quick_focus=quick_focus,
+                apply_best=apply_best,
+                server_url=server_url,
+            )
+        else:
+            return resp.json()
+    except requests.exceptions.RequestException:
+        raise
 
 
 def two_stage_tune(

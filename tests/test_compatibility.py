@@ -963,6 +963,36 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(res["tuning_mode"], "two_stage_zoom")
             self.assertEqual(res["final_best"]["value"], 66.2)
 
+        # Test 404 fallback to client_side_tune
+        with patch("requests.post") as mock_post, patch("requests.get") as mock_get:
+            tune_404_resp = Mock(status_code=404)
+            patch_resp = Mock(status_code=200, json=lambda: {"status": "ok"})
+            mock_post.side_effect = [tune_404_resp, patch_resp, patch_resp, patch_resp]
+
+            status_resp = Mock(status_code=200, json=lambda: {
+                "status": "ok",
+                "data": {
+                    "ray_trace_valid": True,
+                    "geo_spot_diameter_um": 3.0,
+                    "surfaces": [
+                        {"index": 0, "comment": "OBJ"},
+                        {"index": 1, "radius": 60.0, "thickness": 5.0},
+                        {"index": 2, "radius": 0.0, "thickness": 95.0},
+                        {"index": 3, "comment": "IMA"}
+                    ]
+                }
+            })
+            mock_get.return_value = status_resp
+
+            from zemax_tuner import call_tune_api
+            fallback_res = call_tune_api(
+                surface_index=1, parameter="radius", min_value=50.0, max_value=70.0,
+                steps=2, apply_best=False
+            )
+            self.assertEqual(fallback_res["status"], "ok")
+            self.assertEqual(fallback_res["execution_mode"], "client_side_fallback")
+            self.assertFalse(fallback_res["applied"])
+
 
 if __name__ == "__main__":
     unittest.main()
