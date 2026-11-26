@@ -1,0 +1,166 @@
+{
+  "aperture_type": "ImageSpaceFNum",
+  "aperture_value": 2.0,
+  "fovs": [0.0, 5.7, 9.5, 13.3, 16.15, 19.0],
+  "afocal_mode": false,
+  "wavelength_preset": "FdC_Visible",
+  "surfaces": [
+    {
+      "comment": "L1_NegMen_Front",
+      "radius": 35.4294,
+      "thickness": 2.4056,
+      "material": "N-F2",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L1_NegMen_Back",
+      "radius": 12.4217,
+      "thickness": 8.75,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "L2_Pos_Front",
+      "radius": 17.2734,
+      "thickness": 3.5791,
+      "material": "N-LAF34",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L2_Pos_Back",
+      "radius": -68.9228,
+      "thickness": 0.5294,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "L3_CrownFront",
+      "radius": 9.626,
+      "thickness": 2.0722,
+      "material": "N-SK16",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L3_L4_Cemented",
+      "radius": 9.6836,
+      "thickness": 1.9268,
+      "material": "N-SF10",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L4_Back",
+      "radius": 6.8339,
+      "thickness": 2.9708,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "Stop",
+      "radius": 0.0,
+      "thickness": 3.886,
+      "material": "",
+      "is_stop": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "L5_FlintFront",
+      "radius": -7.099,
+      "thickness": 1.52,
+      "material": "N-SF6",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L5_FlintBack",
+      "radius": 35.1277,
+      "thickness": 0.35,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "L6_CrownFront",
+      "radius": 35.1277,
+      "thickness": 3.3248,
+      "material": "N-LAK8",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L6_Back",
+      "radius": -10.5132,
+      "thickness": 0.26,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "L7_Front",
+      "radius": 881.3187,
+      "thickness": 2.0881,
+      "material": "N-LAF34",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L7_Back",
+      "radius": -21.797,
+      "thickness": 0.26,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "L8_Front",
+      "radius": 22.3049,
+      "thickness": 2.4735,
+      "material": "N-LAF34",
+      "radius_variable": true,
+      "thickness_variable": true,
+      "material_substitute": true,
+      "substitute_catalog": "SCHOTT"
+    },
+    {
+      "comment": "L8_Back",
+      "radius": 442.0719,
+      "thickness": 9.9,
+      "material": "",
+      "radius_variable": true,
+      "thickness_variable": true
+    },
+    {
+      "comment": "CoverGlass_Front",
+      "radius": 0.0,
+      "thickness": 0.7,
+      "material": "N-BK7"
+    },
+    {
+      "comment": "CoverGlass_Back",
+      "radius": 0.0,
+      "thickness": 0.9,
+      "material": "",
+      "thickness_variable": true
+    }
+  ]
+}
