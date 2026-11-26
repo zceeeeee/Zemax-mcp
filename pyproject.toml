@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zemax-mcp"
-version = "0.2.0"
+version = "1.0.0"
 description = "Ansys Zemax OpticStudio 2024 R2 MCP Server (Streamable HTTP & stdio) and CLI"
 readme = "README.md"
 requires-python = ">=3.9,<3.13"
