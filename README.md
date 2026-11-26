@@ -1,6 +1,44 @@
 # Zemax-mcp
 
-Ansys Zemax OpticStudio 2024 R2 自动化光学设计脚手架，采用 **常驻服务端 + HTTP 命令行客户端** 架构。虽然仓库名包含 MCP，当前实现是本地 HTTP CLI，并非 MCP 协议服务器。
+Ansys Zemax OpticStudio 2024 R2 自动化光学设计 MCP 服务器与 HTTP/CLI 工具集，采用 **Streamable HTTP MCP（`/mcp`）+ 兼容 HTTP REST/CLI** 双模架构。
+
+## MCP 接入方式（Streamable HTTP 优先）
+
+1. 启动常驻服务端（同时暴露 `/mcp` Streamable HTTP 与 `/status` 等 REST 接口）：
+
+```powershell
+$env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
+.\.venv\Scripts\python.exe zemax_server.py
+```
+
+2. 在支持 MCP 的客户端（Claude Code / Cursor / Antigravity 等）中使用项目根目录的 [`.mcp.json`](.mcp.json)：
+
+```json
+{
+  "mcpServers": {
+    "zemax-opticstudio": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+如需 `stdio` 子进程模式，可执行：`.\.venv\Scripts\python.exe -m zemax_mcp.mcp_server --transport stdio`。
+
+已注册的 MCP 能力（共 20 Tools / 3 Resources / 5 Prompts）：
+- **核心建模与优化 Tools**：`zemax_get_status`、`zemax_load_file`、`zemax_save_file`、`zemax_build_system`（支持 EPD / ImageSpaceFNum / ObjectSpaceNA / FloatByStopSize、多维视场及自定义波长）、`zemax_patch_surface`（支持 Standard / EvenAsphere、Conic、高次项及 `material_substitute`）、`zemax_quick_focus`、`zemax_optimize`（支持 `min_edge_thickness` 玻璃边缘约束）、`zemax_evaluate`、`zemax_tune_parameter`
+- **光学物理大脑 Tools**：
+  - `zemax_get_aberrations`（系统/逐面赛德尔像差 + `AXCL`/`LACL`/`PETZ` + 表面贡献占比 + 高/初级像差归因建议）
+  - `zemax_synthesize_initial_design`（Coddington / P-W 自动初始结构：`singlet_min_spha` / `achromatic_doublet` / `cooke_triplet`）
+  - `zemax_scale_system`（倍率或目标焦距整体缩放）
+  - `zemax_hammer_optimize`（限时 Hammer 全局逃逸 + 玻璃替换）
+  - `zemax_split_lens`（光焦度守恒透镜分裂 + 失败自动回滚）
+  - `zemax_promote_asphere`（渐进式非球面升级 + 防退化 Conic 回滚）
+- **状态与可视化 Tools**：`zemax_snapshot_create`、`zemax_undo`、`zemax_rollback`、`zemax_list_snapshots`、`zemax_export_layout`（返回 `ImageContent`）
+- **Resources**：`zemax://system/state`、`zemax://system/snapshots`、`zemax://samples/list`
+- **Prompts**：`design_singlet_workflow`、`design_afocal_telescope_workflow`、`design_asphere_workflow`、`diagnose_tir_9e9`、`physics_driven_design_loop`
+- **安全与容错**：默认路径沙箱（`ZEMAX_WORKSPACE_DIR` + 官方 `Samples`）；`load`/`build`/`optimize`/`hammer`/`scale`/`split`/`promote` 自动创建快照；服务启动连接失败时优雅降级并按需重连。
 
 ## 环境要求
 
@@ -99,7 +137,7 @@ $env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
 ## 离线检查
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pytest -v
 .\.venv\Scripts\python.exe -m pip check
 ```
 

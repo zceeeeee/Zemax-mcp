@@ -17,70 +17,70 @@ import argparse
 import requests
 from typing import Dict, Any, Optional, List
 
+try:
+    from zemax_mcp.services.optical_service import analyze_sweep_trend as _analyze_client_trend
+except ImportError:
+    _analyze_client_trend = None
+
 SERVER_URL = "http://127.0.0.1:8765"
 
+if _analyze_client_trend is None:
+    def _analyze_client_trend(
+        results: List[Dict[str, Any]],
+        best_candidate: Optional[Dict[str, Any]],
+        min_val: float,
+        max_val: float,
+    ) -> Dict[str, Any]:
+        """客户端降级模式下的灵敏度与极值趋势诊断"""
+        valid_points = [r for r in results if r.get("ray_trace_valid") and r.get("metric_value") is not None]
+        valid_count = len(valid_points)
 
-def _analyze_client_trend(
-    results: List[Dict[str, Any]],
-    best_candidate: Optional[Dict[str, Any]],
-    min_val: float,
-    max_val: float,
-) -> Dict[str, Any]:
-    """客户端降级模式下的灵敏度与极值趋势诊断"""
-    valid_points = [r for r in results if r.get("ray_trace_valid") and r.get("metric_value") is not None]
-    valid_count = len(valid_points)
+        if valid_count == 0 or best_candidate is None:
+            return {
+                "direction": "all_invalid",
+                "summary": "所有扫描采样点光线追迹均失败 (全反射或严重切光)，无法形成有效像质评估。建议反转曲率方向或调整扫描区间。",
+                "recommended_range": None,
+            }
 
-    if valid_count == 0 or best_candidate is None:
-        return {
-            "direction": "all_invalid",
-            "summary": "所有扫描采样点光线追迹均失败 (全反射或严重切光)，无法形成有效像质评估。建议反转曲率方向或调整扫描区间。",
-            "recommended_range": None,
-        }
+        best_val = best_candidate["value"]
+        best_metric = best_candidate["metric_value"]
 
-    best_val = best_candidate["value"]
-    best_metric = best_candidate["metric_value"]
+        if valid_count == 1:
+            step_delta = abs(max_val - min_val) * 0.1
+            return {
+                "direction": "single_valid_point",
+                "summary": f"仅在参数值 {best_val} 处光线追迹有效 (指标: {best_metric})，其余采样点均失效。建议以此点为中心缩小范围精细扫描。",
+                "recommended_range": [round(best_val - step_delta, 4), round(best_val + step_delta, 4)],
+            }
 
-    if valid_count == 1:
-        step_delta = abs(max_val - min_val) * 0.1
-        return {
-            "direction": "single_valid_point",
-            "summary": f"仅在参数值 {best_val} 处光线追迹有效 (指标: {best_metric})，其余采样点均失效。建议以此点为中心缩小范围精细扫描。",
-            "recommended_range": [round(best_val - step_delta, 4), round(best_val + step_delta, 4)],
-        }
+        best_idx = next((idx for idx, r in enumerate(results) if r["value"] == best_val), None)
+        n = len(results)
+        step_size = abs(max_val - min_val) / max(n - 1, 1)
 
-    best_idx = None
-    for idx, r in enumerate(results):
-        if r["value"] == best_val:
-            best_idx = idx
-            break
-
-    n = len(results)
-    step_size = abs(max_val - min_val) / max(n - 1, 1)
-
-    if best_idx == 0:
-        rec_min = min_val - step_size * 2.0
-        rec_max = min_val + step_size
-        return {
-            "direction": "monotonic_boundary_min",
-            "summary": f"像质在起始边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
-            "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)],
-        }
-    elif best_idx == n - 1:
-        rec_min = max_val - step_size
-        rec_max = max_val + step_size * 2.0
-        return {
-            "direction": "monotonic_boundary_max",
-            "summary": f"像质在终止边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
-            "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)],
-        }
-    else:
-        prev_val = results[best_idx - 1]["value"]
-        next_val = results[best_idx + 1]["value"]
-        return {
-            "direction": "interior_minimum",
-            "summary": f"在参数值 {best_val} 处发现明确的像质最优极值点 (指标: {best_metric})，两侧像质均退化。此区域具备良好的局部收敛特征。",
-            "recommended_range": [round(min(prev_val, next_val), 4), round(max(prev_val, next_val), 4)],
-        }
+        if best_idx == 0:
+            rec_min = min_val - step_size * 2.0
+            rec_max = min_val + step_size
+            return {
+                "direction": "monotonic_boundary_min",
+                "summary": f"像质在起始边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
+                "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)],
+            }
+        elif best_idx == n - 1:
+            rec_min = max_val - step_size
+            rec_max = max_val + step_size * 2.0
+            return {
+                "direction": "monotonic_boundary_max",
+                "summary": f"像质在终止边界 {best_val} 处最优 (指标: {best_metric})，呈现向外侧单调改善趋势。建议向该方向扩展扫描范围。",
+                "recommended_range": [round(min(rec_min, rec_max), 4), round(max(rec_min, rec_max), 4)],
+            }
+        else:
+            prev_val = results[best_idx - 1]["value"]
+            next_val = results[best_idx + 1]["value"]
+            return {
+                "direction": "interior_minimum",
+                "summary": f"在参数值 {best_val} 处发现明确的像质最优极值点 (指标: {best_metric})，两侧像质均退化。此区域具备良好的局部收敛特征。",
+                "recommended_range": [round(min(prev_val, next_val), 4), round(max(prev_val, next_val), 4)],
+            }
 
 
 def client_side_tune(
@@ -342,11 +342,13 @@ def two_stage_tune(
 
     # 如果无法形成有效推荐范围（如全部追迹失败）
     if not rec_range or len(rec_range) != 2:
+        best1 = res_s1.get("best_candidate")
         return {
             "status": "warning",
             "message": "第一阶段扫描未产生有效的精修推荐区间",
             "stage1": res_s1,
-            "final_best": res_s1.get("best_candidate"),
+            "best_candidate": best1,
+            "final_best": best1,
         }
 
     s2_min, s2_max = rec_range[0], rec_range[1]
@@ -365,6 +367,7 @@ def two_stage_tune(
         server_url=server_url,
     )
 
+    final_best = res_s2.get("best_candidate") or res_s1.get("best_candidate")
     return {
         "status": "ok",
         "tuning_mode": "two_stage_zoom",
@@ -380,7 +383,8 @@ def two_stage_tune(
             "best": res_s2.get("best_candidate"),
             "trend": res_s2.get("trend_analysis", {}).get("summary"),
         },
-        "final_best": res_s2.get("best_candidate") or res_s1.get("best_candidate"),
+        "best_candidate": final_best,
+        "final_best": final_best,
         "stage2_full_result": res_s2,
     }
 
@@ -454,7 +458,7 @@ def render_ascii_report(data: Dict[str, Any]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Zemax AI Agent 自动快速调参器")
     parser.add_argument("--index", type=int, required=True, help="要调节的表面序号 (从1开始)")
-    parser.add_argument("--param", type=str, required=True, choices=["radius", "thickness", "semi_diameter"], help="调参变量名称")
+    parser.add_argument("--param", type=str, required=True, choices=["radius", "thickness", "semi_diameter", "conic"], help="调参变量名称")
     parser.add_argument("--min", type=float, required=True, dest="min_val", help="扫描起始/最小值")
     parser.add_argument("--max", type=float, required=True, dest="max_val", help="扫描终止/最大值")
     parser.add_argument("--steps", type=int, default=10, help="采样点数 (默认 10)")

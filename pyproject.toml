@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zemax-mcp"
+version = "0.2.0"
+description = "Ansys Zemax OpticStudio 2024 R2 MCP Server (Streamable HTTP & stdio) and CLI"
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+    "pythonnet>=3.0.3",
+    "zospy>=1.2.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "pydantic>=2.6.0",
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+    "mcp>=1.2.0",
+]
+
+[project.scripts]
+zemax-server = "zemax_mcp.api.http_app:main"
+zemax-mcp = "zemax_mcp.mcp_server:main"
+zemax-cli = "zemax_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zemax_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]

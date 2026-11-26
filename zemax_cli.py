@@ -1,4 +1,5 @@
 # zemax_cli.py
+import sys
 import json
 import argparse
 import requests
@@ -23,11 +24,18 @@ def main():
     # 4. patch
     p_patch = subparsers.add_parser("patch", help="修改单个表面参数")
     p_patch.add_argument("--index", type=int, required=True, help="表面序号(从1开始)")
+    p_patch.add_argument("--surface-type", type=str, choices=["Standard", "EvenAsphere"], help="切换表面类型")
     p_patch.add_argument("--radius", type=float, help="曲率半径(0为无穷大)")
     p_patch.add_argument("--thickness", type=float, help="厚度")
     p_patch.add_argument("--material", type=str, help="玻璃材料")
+    p_patch.add_argument("--conic", type=float, help="圆锥常数 (Conic k)")
     p_patch.add_argument("--var-r", type=int, choices=[0, 1], help="曲率半径是否设为变量(1是,0否)")
     p_patch.add_argument("--var-t", type=int, choices=[0, 1], help="厚度是否设为变量(1是,0否)")
+    p_patch.add_argument("--var-c", type=int, choices=[0, 1], help="圆锥常数是否设为变量(1是,0否)")
+    p_patch.add_argument("--material-sub", type=int, choices=[0, 1], help="材料是否设为 Hammer 替换变量(1是,0否)")
+    p_patch.add_argument("--catalog", type=str, default="SCHOTT", help="玻璃替换库名 (默认 SCHOTT)")
+    p_patch.add_argument("--asphere-terms", type=str, help="偶次非球面高次项 JSON，如 '{\"4\": -1e-6, \"6\": 2e-9}'")
+    p_patch.add_argument("--asphere-vars", type=str, help="偶次非球面变量 JSON，如 '{\"4\": true, \"6\": true}'")
     p_patch.add_argument("--marginal-ray-height", action="store_true", help="将该面厚度设置为边缘光线高度求解 (MarginalRayHeight, Height=0.0, PupilZone=0.0)")
     p_aperture = p_patch.add_mutually_exclusive_group()
     p_aperture.add_argument("--semi-diameter", type=float, help="固定半口径(mm)，必须为正数，通常优先使用自动半口径")
@@ -42,6 +50,7 @@ def main():
     p_opt.add_argument("--effl-weight", type=float, default=10.0, help="焦距锁定权重 (默认 10.0)")
     p_opt.add_argument("--max-totr", type=float, help="限制系统最大总长 TOTR <= 该值 (mm)")
     p_opt.add_argument("--min-bfl", type=float, help="限制最小后工作距/后截距 >= 该值 (mm)")
+    p_opt.add_argument("--min-edge", type=float, help="限制玻璃最小边缘厚度 MNEG >= 该值 (mm)")
     p_opt.add_argument("--achromatic", action="store_true", help="加入 AXCL 强制消除轴向色差")
     p_opt.add_argument("--trac-mf", action="store_true", help="使用讲义专用的 6 孔径带 TRAC + MNCA + MXCA + EFFL 评价函数")
     p_opt.add_argument("--custom-op", type=str, help="额外自定义操作数 JSON 数组字符串")
@@ -59,10 +68,13 @@ def main():
     # 8. quick_focus
     subparsers.add_parser("quick_focus", help="调用 QuickFocus 工具寻找最佳像面位置")
 
+    # 8b. aberrations
+    subparsers.add_parser("aberrations", help="读取初级赛德尔像差系数 (SPHA/COMA/ASTI/FCUR/DIST) 与轴向色差")
+
     # 9. tune
     p_tune = subparsers.add_parser("tune", help="在指定范围内对某一表面参数进行快速自动扫描调参并反馈")
     p_tune.add_argument("--index", type=int, required=True, help="表面序号 (从1开始)")
-    p_tune.add_argument("--param", type=str, required=True, choices=["radius", "thickness", "semi_diameter"], help="调参变量类型")
+    p_tune.add_argument("--param", type=str, required=True, choices=["radius", "thickness", "semi_diameter", "conic"], help="调参变量类型")
     p_tune.add_argument("--min", type=float, required=True, dest="min_val", help="扫描起始/最小值")
     p_tune.add_argument("--max", type=float, required=True, dest="max_val", help="扫描终止/最大值")
     p_tune.add_argument("--steps", type=int, default=10, help="采样点数 (默认 10，2~100)")
@@ -70,6 +82,41 @@ def main():
     p_tune.add_argument("--target-effl", type=float, default=None, help="若 criterion 为 effl_diff 时的目标焦距 (mm)")
     p_tune.add_argument("--quick-focus", action="store_true", help="每个采样点后自动执行快速对焦")
     p_tune.add_argument("--apply-best", action="store_true", help="自动将最优参数应用到当前系统中")
+
+    # 10. hammer
+    p_hammer = subparsers.add_parser("hammer", help="运行限时 Hammer 全局优化逃逸局部极小值")
+    p_hammer.add_argument("--time", type=float, default=0.25, help="运行时间(分钟，上限3.0)")
+    p_hammer.add_argument("--effl", type=float, help="目标有效焦距 EFFL (mm)")
+    p_hammer.add_argument("--min-edge", type=float, help="最小玻璃边缘厚度 MNEG (mm)")
+    p_hammer.add_argument("--wavefront", action="store_true", help="波前差基底")
+    p_hammer.add_argument("--achromatic", action="store_true", help="加入 AXCL 消除轴向色差")
+
+    # 11. synthesize
+    p_synth = subparsers.add_parser("synthesize", help="基于 P-W/初阶理论综合初始光学结构")
+    p_synth.add_argument("--topology", required=True, choices=["singlet_min_spha", "achromatic_doublet", "cooke_triplet"])
+    p_synth.add_argument("--effl", type=float, required=True, help="目标焦距 (mm)")
+    p_synth.add_argument("--epd", type=float, required=True, help="入瞳直径 (mm)")
+    p_synth.add_argument("--fovs", type=float, nargs="+", default=[0.0], help="Y方向视场角列表")
+    p_synth.add_argument("--glasses", type=str, nargs="+", default=None, help="指定玻璃牌号列表")
+    p_synth.add_argument("--no-apply", action="store_true", help="仅生成配置不立即构建")
+
+    # 12. scale
+    p_scale = subparsers.add_parser("scale", help="按倍率或目标焦距整体缩放当前光学系统")
+    p_scale.add_argument("--factor", type=float, help="直接缩放倍率")
+    p_scale.add_argument("--effl", type=float, help="目标有效焦距 (mm)")
+
+    # 13. split
+    p_split = subparsers.add_parser("split", help="安全透镜分裂（保持总光焦度拆分为两片同材料透镜）")
+    p_split.add_argument("--index", type=int, required=True, help="透镜前表面序号")
+    p_split.add_argument("--ratio", type=float, default=0.5, help="光焦度分配比 (0.1~0.9)")
+    p_split.add_argument("--air-gap", type=float, default=1.0, help="分裂后空气间隔 (mm)")
+
+    # 14. promote-asphere
+    p_promo = subparsers.add_parser("promote-asphere", help="渐进式非球面升级（Conic -> 高次项 + MNEG）")
+    p_promo.add_argument("--index", type=int, required=True, help="目标表面序号")
+    p_promo.add_argument("--max-order", type=int, default=6, choices=[4, 6, 8], help="最高阶次")
+    p_promo.add_argument("--effl", type=float, help="目标有效焦距 (mm)")
+    p_promo.add_argument("--min-edge", type=float, default=1.2, help="最小边缘厚度 (mm)")
 
     args = parser.parse_args()
 
@@ -87,11 +134,19 @@ def main():
             resp = requests.post(f"{SERVER_URL}/build", json=payload)
         elif args.command == "patch":
             payload = {"surface_index": args.index}
+            if args.surface_type is not None: payload["surface_type"] = args.surface_type
             if args.radius is not None: payload["radius"] = args.radius
             if args.thickness is not None: payload["thickness"] = args.thickness
             if args.material is not None: payload["material"] = args.material
+            if args.conic is not None: payload["conic"] = args.conic
             if args.var_r is not None: payload["radius_variable"] = bool(args.var_r)
             if args.var_t is not None: payload["thickness_variable"] = bool(args.var_t)
+            if args.var_c is not None: payload["conic_variable"] = bool(args.var_c)
+            if args.material_sub is not None:
+                payload["material_substitute"] = bool(args.material_sub)
+                payload["substitute_catalog"] = args.catalog
+            if args.asphere_terms: payload["asphere_terms"] = {int(k): float(v) for k, v in json.loads(args.asphere_terms).items()}
+            if args.asphere_vars: payload["asphere_terms_variable"] = {int(k): bool(v) for k, v in json.loads(args.asphere_vars).items()}
             if args.marginal_ray_height: payload["marginal_ray_height_solve"] = True
             if args.semi_diameter is not None: payload["semi_diameter"] = args.semi_diameter
             if args.semi_diameter_auto: payload["semi_diameter_auto"] = True
@@ -108,6 +163,7 @@ def main():
             if args.effl is not None: payload["target_effl"] = args.effl
             if args.max_totr is not None: payload["max_totr"] = args.max_totr
             if args.min_bfl is not None: payload["min_bfl"] = args.min_bfl
+            if args.min_edge is not None: payload["min_edge_thickness"] = args.min_edge
             if args.custom_op: payload["custom_operands"] = json.loads(args.custom_op)
             resp = requests.post(f"{SERVER_URL}/optimize", json=payload)
         elif args.command == "evaluate":
@@ -119,6 +175,8 @@ def main():
             resp = requests.post(f"{SERVER_URL}/save", json={"filepath": args.filepath})
         elif args.command == "quick_focus":
             resp = requests.post(f"{SERVER_URL}/quick_focus")
+        elif args.command == "aberrations":
+            resp = requests.get(f"{SERVER_URL}/aberrations")
         elif args.command == "tune":
             payload = {
                 "surface_index": args.index,
@@ -133,13 +191,56 @@ def main():
             if args.target_effl is not None:
                 payload["target_effl"] = args.target_effl
             resp = requests.post(f"{SERVER_URL}/tune", json=payload)
+        elif args.command == "hammer":
+            payload = {
+                "target_run_time_minutes": args.time,
+                "use_wavefront": args.wavefront,
+                "minimize_axial_color": args.achromatic,
+            }
+            if args.effl is not None: payload["target_effl"] = args.effl
+            if args.min_edge is not None: payload["min_edge_thickness"] = args.min_edge
+            resp = requests.post(f"{SERVER_URL}/hammer_optimize", json=payload)
+        elif args.command == "synthesize":
+            payload = {
+                "topology": args.topology,
+                "target_effl": args.effl,
+                "epd": args.epd,
+                "fovs": args.fovs,
+                "apply_to_system": not args.no_apply,
+            }
+            if args.glasses is not None: payload["glasses"] = args.glasses
+            resp = requests.post(f"{SERVER_URL}/synthesize", json=payload)
+        elif args.command == "scale":
+            payload = {}
+            if args.factor is not None: payload["scale_factor"] = args.factor
+            if args.effl is not None: payload["target_effl"] = args.effl
+            resp = requests.post(f"{SERVER_URL}/scale", json=payload)
+        elif args.command == "split":
+            resp = requests.post(
+                f"{SERVER_URL}/split_lens",
+                json={"surface_index": args.index, "split_ratio": args.ratio, "air_gap": args.air_gap},
+            )
+        elif args.command == "promote-asphere":
+            payload = {
+                "surface_index": args.index,
+                "max_order": args.max_order,
+                "min_edge_thickness": args.min_edge,
+            }
+            if args.effl is not None: payload["target_effl"] = args.effl
+            resp = requests.post(f"{SERVER_URL}/promote_asphere", json=payload)
 
-        print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
+        data = resp.json()
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        if (isinstance(resp.status_code, int) and resp.status_code >= 400) or (
+            isinstance(data, dict) and data.get("status") not in (None, "ok")
+        ):
+            sys.exit(1)
     except requests.exceptions.ConnectionError:
         print(json.dumps({
             "status": "fatal",
             "message": "无法连接到 zemax_server.py！请确认已在独立终端启动后台守护进程。"
         }, ensure_ascii=False))
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

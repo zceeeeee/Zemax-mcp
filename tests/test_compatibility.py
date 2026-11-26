@@ -13,19 +13,36 @@ from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / "zemax_server.py").read_text(encoding="utf-8")
-HELPERS = {
-    "_insert_operand_row", "_get_primary_wavelength_index",
-    "_get_rms_spot_radii", "_json_safe_state", "_extract_system_state",
-    "_get_normalized_field_coordinates", "_set_marginal_ray_height_solve",
-    "_analyze_sweep_trend",
+SRC_DIR = ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from zemax_mcp.api.http_app import create_app
+from zemax_mcp.core import zos_compat
+from zemax_mcp.schemas import optical as optical_schemas
+from zemax_mcp.services import optical_service
+
+def _call_extract_with_namespace(*a, **kw):
+    with patch.object(optical_service, "_get_primary_wavelength_index", NAMESPACE["_get_primary_wavelength_index"]), \
+         patch.object(optical_service, "_get_rms_spot_radii", NAMESPACE["_get_rms_spot_radii"]):
+        return optical_service.extract_system_state(*a, zp_mod=NAMESPACE.get("zp"), **kw)
+
+
+NAMESPACE: Dict[str, Any] = {
+    "math": math,
+    "Dict": dict,
+    "Any": object,
+    "List": list,
+    "Optional": Optional,
+    "_json_safe_state": zos_compat._json_safe_state,
+    "_get_primary_wavelength_index": zos_compat._get_primary_wavelength_index,
+    "_get_rms_spot_radii": zos_compat._get_rms_spot_radii,
+    "_analyze_sweep_trend": optical_service.analyze_sweep_trend,
+    "_insert_operand_row": lambda *a, **kw: zos_compat._insert_operand_row(*a, zp_mod=NAMESPACE.get("zp"), **kw),
+    "_get_normalized_field_coordinates": lambda *a, **kw: zos_compat._get_normalized_field_coordinates(*a, zp_mod=NAMESPACE.get("zp"), **kw),
+    "_set_marginal_ray_height_solve": lambda *a, **kw: zos_compat._set_marginal_ray_height_solve(*a, zp_mod=NAMESPACE.get("zp"), **kw),
+    "_extract_system_state": _call_extract_with_namespace,
 }
-TREE = ast.parse(SOURCE)
-NAMESPACE = {"math": math, "Dict": dict, "Any": object, "List": list, "Optional": Optional}
-exec(compile(ast.Module(body=[
-    node for node in TREE.body
-    if isinstance(node, ast.FunctionDef) and node.name in HELPERS
-], type_ignores=[]), "<server-helpers>", "exec"), NAMESPACE)
 
 
 class Matrix:
@@ -66,32 +83,50 @@ def with_tool(tool):
 
 
 def server_function(name, **bindings):
-    route = next(node for node in ast.parse(SOURCE).body
-                 if isinstance(node, ast.FunctionDef) and node.name == name)
-    route.decorator_list = []
-    namespace = dict(NAMESPACE, traceback=traceback, **bindings)
-    exec(compile(ast.Module(body=[route], type_ignores=[]), "<server-route>", "exec"), namespace)
-    return namespace[name]
+    fn = getattr(optical_service, name)
+    zm = bindings.get("zm")
+    zp_mod = bindings.get("zp")
+
+    patch_map = {}
+    name_remap = {
+        "_extract_system_state": "extract_system_state",
+        "_get_primary_wavelength_index": "_get_primary_wavelength_index",
+        "_get_rms_spot_radii": "_get_rms_spot_radii",
+        "_get_normalized_field_coordinates": "_get_normalized_field_coordinates",
+        "_insert_operand_row": "_insert_operand_row",
+        "_set_variable": "_set_variable",
+        "_set_marginal_ray_height_solve": "_set_marginal_ray_height_solve",
+        "os": "os",
+    }
+    for key, target_name in name_remap.items():
+        if key in bindings:
+            val = bindings[key]
+            if callable(val):
+                def _make_adapter(f):
+                    return lambda *a, **kw: (kw.pop("zp_mod", None), f(*a, **kw))[1]
+                patch_map[target_name] = _make_adapter(val)
+            else:
+                patch_map[target_name] = val
+
+    def _wrapper(*args, **kwargs):
+        from contextlib import ExitStack
+
+        def _invoke():
+            with ExitStack() as stack:
+                for target_name, replacement in patch_map.items():
+                    stack.enter_context(patch.object(optical_service, target_name, replacement))
+                return fn(zm.connect(), *args, zp_mod=zp_mod, **kwargs)
+
+        return optical_service.safe_call(_invoke, include_trace=True)
+
+    return _wrapper
 
 
 def validation_app():
-    from fastapi import FastAPI, Request
-    from fastapi.encoders import jsonable_encoder
-    from fastapi.exceptions import RequestValidationError
-    from fastapi.responses import JSONResponse
-    from pydantic import BaseModel, Field
-    from typing import Optional
-
-    namespace = dict(NAMESPACE, app=FastAPI(), BaseModel=BaseModel, Field=Field, Optional=Optional,
-                     Request=Request, RequestValidationError=RequestValidationError,
-                     JSONResponse=JSONResponse, jsonable_encoder=jsonable_encoder, zm=Mock())
-    namespace["zm"].connect.side_effect = AssertionError("Validation must reject input before connecting")
-    names = {"SurfacePatchRequest", "EvaluateRequest", "ParameterTuneRequest", "request_validation_error_handler",
-             "patch_surface", "evaluate_image_quality", "tune_parameter"}
-    nodes = [node for node in TREE.body
-             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<validation-app>", "exec"), namespace)
-    return namespace["app"], namespace["zm"]
+    zm = Mock()
+    zm.connect.side_effect = AssertionError("Validation must reject input before connecting")
+    app = create_app(connection_manager=zm, connect_on_startup=False)
+    return app, zm
 
 
 async def asgi_post(app, path, body):
@@ -390,11 +425,8 @@ class CompatibilityTests(unittest.TestCase):
         self.assertTrue(tool.closed)
 
     def test_evaluation_request_bounds(self):
-        from pydantic import BaseModel, Field, ValidationError
-        model = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "EvaluateRequest")
-        namespace = {"BaseModel": BaseModel, "Field": Field}
-        exec(compile(ast.Module(body=[model], type_ignores=[]), "<evaluate-model>", "exec"), namespace)
-        request = namespace["EvaluateRequest"]
+        from pydantic import ValidationError
+        request = optical_schemas.EvaluateRequest
         self.assertEqual(request().mtf_sampling, 3)
         for payload in ({"mtf_sampling": 0}, {"mtf_sampling": 5}, {"mtf_sampling": True},
                         {"mtf_sampling": 2.5}, {"num_freq_points": 0},
@@ -531,12 +563,8 @@ class CompatibilityTests(unittest.TestCase):
         cell.SetSolveData.assert_not_called()
 
     def test_patch_request_half_aperture_bounds(self):
-        from pydantic import BaseModel, Field, ValidationError
-        from typing import Optional
-        model = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "SurfacePatchRequest")
-        namespace = {"BaseModel": BaseModel, "Field": Field, "Optional": Optional}
-        exec(compile(ast.Module(body=[model], type_ignores=[]), "<patch-model>", "exec"), namespace)
-        request = namespace["SurfacePatchRequest"]
+        from pydantic import ValidationError
+        request = optical_schemas.SurfacePatchRequest
         for value in (0, -1, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 request(surface_index=1, semi_diameter=value)
@@ -553,10 +581,11 @@ class CompatibilityTests(unittest.TestCase):
             _extract_system_state=lambda _: {},
         )
         self.assertEqual(load(SimpleNamespace(filepath="saved.zmx"))["status"], "ok")
-        oss.load.assert_called_once_with("saved.zmx")
+        oss.load.assert_called_once_with(str((ROOT / "saved.zmx").resolve()))
         oss.Analyses.New_Analysis.assert_not_called()
+        svc_tree = ast.parse((SRC_DIR / "zemax_mcp" / "services" / "optical_service.py").read_text(encoding="utf-8"))
         for name in ("build_system", "load_zmx_file"):
-            node = next(node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name == name)
+            node = next(node for node in svc_tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
             self.assertFalse(any(isinstance(child, ast.Attribute) and child.attr == "Analyses"
                                  for child in ast.walk(node)))
 
@@ -608,31 +637,24 @@ class CompatibilityTests(unittest.TestCase):
         cell.SetSolveData.assert_called_once_with(solve_obj)
 
     def test_pydantic_models_for_experiment5(self):
-        from pydantic import BaseModel, Field
-        from typing import Optional, List
-        names = ["SurfaceItem", "SystemBuildRequest", "SurfacePatchRequest", "OptimizeRequest", "CustomOperandItem"]
-        nodes = [node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name in names]
-        namespace = {"BaseModel": BaseModel, "Field": Field, "Optional": Optional, "List": List}
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<models-exp5>", "exec"), namespace)
-
         # 1. SystemBuildRequest 默认 HeNe_0p6328
-        build_req = namespace["SystemBuildRequest"](epd=35.0, surfaces=[])
+        build_req = optical_schemas.SystemBuildRequest(epd=35.0, surfaces=[])
         self.assertEqual(build_req.wavelength_preset, "HeNe_0p6328")
-        build_req2 = namespace["SystemBuildRequest"](epd=35.0, surfaces=[], wavelength_preset="FdC_Visible")
+        build_req2 = optical_schemas.SystemBuildRequest(epd=35.0, surfaces=[], wavelength_preset="FdC_Visible")
         self.assertEqual(build_req2.wavelength_preset, "FdC_Visible")
 
         # 2. SurfaceItem 支持 marginal_ray_height_solve
-        surf_item = namespace["SurfaceItem"](comment="test", radius=100.0, thickness=5.0, material="N-BK7", marginal_ray_height_solve=True)
+        surf_item = optical_schemas.SurfaceItem(comment="test", radius=100.0, thickness=5.0, material="N-BK7", marginal_ray_height_solve=True)
         self.assertTrue(surf_item.marginal_ray_height_solve)
 
         # 3. SurfacePatchRequest 支持 marginal_ray_height_solve
-        patch_req = namespace["SurfacePatchRequest"](surface_index=2, marginal_ray_height_solve=True)
+        patch_req = optical_schemas.SurfacePatchRequest(surface_index=2, marginal_ray_height_solve=True)
         self.assertTrue(patch_req.marginal_ray_height_solve)
 
         # 4. OptimizeRequest 支持 use_trac_spherical_mf
-        opt_req = namespace["OptimizeRequest"]()
+        opt_req = optical_schemas.OptimizeRequest()
         self.assertFalse(opt_req.use_trac_spherical_mf)
-        opt_req_trac = namespace["OptimizeRequest"](use_trac_spherical_mf=True, target_effl=70.0)
+        opt_req_trac = optical_schemas.OptimizeRequest(use_trac_spherical_mf=True, target_effl=70.0)
         self.assertTrue(opt_req_trac.use_trac_spherical_mf)
         self.assertEqual(opt_req_trac.target_effl, 70.0)
 
