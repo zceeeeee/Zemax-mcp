@@ -795,6 +795,49 @@ def test_http_app_degrades_gracefully_when_opticstudio_unavailable():
         assert "OpticStudio not open" in body["message"]
 
 
+def test_opticstudio_directory_auto_discovery_and_override(tmp_path, monkeypatch):
+    from zemax_mcp.core import connection as conn_mod
+
+    # 1. Defaults to None (Windows Registry auto-discovery) when no env var is set
+    monkeypatch.delenv("OPTICSTUDIO_DIRECTORY", raising=False)
+    zm = ZemaxConnectionManager()
+    assert zm.opticstudio_directory is None
+
+    # 2. Respects OPTICSTUDIO_DIRECTORY override
+    monkeypatch.setenv("OPTICSTUDIO_DIRECTORY", r"C:\Custom\Zemax OpticStudio")
+    assert zm.opticstudio_directory == r"C:\Custom\Zemax OpticStudio"
+
+    # 3. discover_opticstudio_directory finds valid ANSYS Inc/<ver>/Zemax OpticStudio layout
+    install_dir = tmp_path / "ANSYS Inc" / "v242" / "Zemax OpticStudio"
+    install_dir.mkdir(parents=True)
+    (install_dir / "ZOSAPI.dll").write_bytes(b"")
+    (install_dir / "ZOSAPI_Interfaces.dll").write_bytes(b"")
+    assert conn_mod.discover_opticstudio_directory(extra_roots=[tmp_path]) == str(install_dir)
+
+    # 4. connect() falls back to discover_opticstudio_directory() if registry lookup fails
+    monkeypatch.delenv("OPTICSTUDIO_DIRECTORY", raising=False)
+    calls: list[str | None] = []
+    fake_oss = _make_fake_oss()
+
+    class _FakeZOS:
+        def __init__(self, opticstudio_directory=None):
+            calls.append(opticstudio_directory)
+            if opticstudio_directory is None:
+                raise FileNotFoundError("NetHelper registry key missing")
+
+        def connect(self, mode="extension"):
+            assert mode == "extension"
+            return fake_oss
+
+    monkeypatch.setattr(conn_mod, "get_zospy", lambda: SimpleNamespace(ZOS=_FakeZOS))
+    monkeypatch.setattr(conn_mod, "discover_opticstudio_directory", lambda: str(install_dir))
+
+    zm2 = ZemaxConnectionManager()
+    assert zm2.connect() is fake_oss
+    assert calls == [None, str(install_dir)]
+
+
+
 
 
 

@@ -7,7 +7,14 @@ Ansys Zemax OpticStudio 2024 R2 自动化光学设计 MCP 服务器与 HTTP/CLI 
 1. 启动常驻服务端（同时暴露 `/mcp` Streamable HTTP 与 `/status` 等 REST 接口）：
 
 ```powershell
-$env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
+# 默认自动通过 Windows 注册表（ZOSAPI_NetHelper）与常见安装目录定位 OpticStudio
+.\.venv\Scripts\python.exe zemax_server.py
+```
+
+若本机安装了多个版本或使用自定义路径且未写入注册表，可在启动前通过 `OPTICSTUDIO_DIRECTORY` 手动覆盖：
+
+```powershell
+$env:OPTICSTUDIO_DIRECTORY = "C:\Program Files\ANSYS Inc\v242\Zemax OpticStudio"
 .\.venv\Scripts\python.exe zemax_server.py
 ```
 
@@ -55,10 +62,16 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-在独立终端中启动服务端。安装位置不同时，通过环境变量指定目录，该目录应包含 `ZOSAPI.dll` 与 `ZOSAPI_Interfaces.dll`：
+在独立终端中启动服务端。程序默认按以下优先级自动定位本机 OpticStudio（无需硬编码盘符）：
+
+1. 环境变量 `OPTICSTUDIO_DIRECTORY`（显式指定时优先生效）；
+2. `zospy` 通过 Windows 注册表（`ZOSAPI_NetHelper`）自动探测已注册版本；
+3. 自动扫描常见安装目录（如 `C:\Program Files\ANSYS Inc\*\Zemax OpticStudio`、`D:\...\Zemax OpticStudio` 等含 `ZOSAPI.dll` 与 `ZOSAPI_Interfaces.dll` 的目录）。
+
+仅当自动定位失败或本机存在多版本需指定其一时，再设置环境变量：
 
 ```powershell
-$env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
+$env:OPTICSTUDIO_DIRECTORY = "C:\Program Files\ANSYS Inc\v242\Zemax OpticStudio"
 .\.venv\Scripts\python.exe zemax_server.py
 ```
 
@@ -100,7 +113,7 @@ $env:OPTICSTUDIO_DIRECTORY = "E:\Zemax\ANSYS Inc\v242\Zemax OpticStudio"
 - `tune --index <面号> --param <radius|thickness|semi_diameter> --min <下界> --max <上界> [--steps 10] [--criterion geo_spot|rms_spot|merit_function|effl_diff] [--quick-focus] [--apply-best]`：在指定区间内快速自动调参。自带沙箱回滚机制，默认扫描评估完成后自动恢复测试前状态；显式指定 `--apply-best` 时才将最优候选值写入系统。可选 `--quick-focus` 在每个采样点自动执行快速对焦以消除离焦干扰。
 - 独立调参脚本 `zemax_tuner.py`：专为 Agent 快速寻优设计，支持 `--two-stage` 两阶段自适应精修（粗调定位极小值后自动缩减区间精调）、终端 ASCII 趋势分布图以及 `--json` 机器格式输出。
 
-更多设计规则参见 [CLAUDE.md](CLAUDE.md)。[项目部署与使用指南.md](项目部署与使用指南.md) 是初始部署参考，运行代码已包含后续接口兼容修正，应以当前代码为准。
+更多设计规则参见 [CLAUDE.md](CLAUDE.md)，完整工程设计实例参见 [example/README.md](example/README.md)。
 
 ## 当前验证状态
 
